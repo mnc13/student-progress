@@ -1,4 +1,68 @@
-.venv/
+# --- Python / FastAPI ---
 __pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+.dist/
+.build/
+.python-version
+.mypy_cache/
+.pytest_cache/
+.coverage
+htmlcov/
+.cache/
+.ruff_cache/
+
+# --- Virtualenvs ---
+.venv/
+venv/
+env/
+
+# --- Environment / secrets ---
 .env
+.env.*
+*.env
+
+# --- Local DB / state ---
+app.db
 *.sqlite
+*.sqlite3
+*.db-journal
+instance/
+
+# --- Logs ---
+*.log
+logs/
+uvicorn.log
+
+# --- Frontend (if you add tooling later) ---
+node_modules/
+dist/
+build/
+
+# --- OS/editor noise ---
+.DS_Store
+Thumbs.db
+ehthumbs.db
+*.swp
+*.swo
+.vscode/
+.idea/
+*.iml
+
+# --- Data imports/exports ---
+data/*.csv
+data/*.xlsx
+data/*.parquet
+!data/README.md
+# keep a sample CSV if you want to share format:
+#!data/sample.csv
+
+# --- Alembic ---
+# Keep migrations under version control. If you generate junk, uncomment next line:
+# alembic.ini
+# alembic/ (keep this tracked unless it's purely local)
+
+# --- Coverage / repo
