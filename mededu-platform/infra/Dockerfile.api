@@ -1,0 +1,9 @@
+FROM node:20
+WORKDIR /app
+COPY package*.json ./
+COPY prisma ./prisma
+RUN npm i -g pnpm
+RUN pnpm i || true
+COPY . .
+RUN npx prisma generate || true
+CMD ["pnpm","dev"]

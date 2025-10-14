@@ -1,0 +1,43 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+/*
+ NOTE: You said your tables already exist.
+ Run: pnpx prisma db pull
+ This schema may be replaced by your introspected DB schema.
+ Below is an example if you want to start fresh.
+*/
+model User {
+  id            String        @id @default(cuid())
+  email         String        @unique
+  passwordHash  String
+  name          String?
+  createdAt     DateTime      @default(now())
+  studySessions StudySession[]
+  preferences   Preference?
+}
+
+model StudySession {
+  id         String   @id @default(cuid())
+  user       User     @relation(fields: [userId], references: [id])
+  userId     String
+  startedAt  DateTime
+  endedAt    DateTime?
+  topic      String?
+  focusLevel Int?
+}
+
+model Preference {
+  id                 String   @id @default(cuid())
+  user               User     @relation(fields: [userId], references: [id])
+  userId             String   @unique
+  targetDailyMinutes Int      @default(60)
+  preferredWindows   Json?
+  timezone           String   @default("Asia/Dhaka")
+}
