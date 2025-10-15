@@ -162,11 +162,13 @@ async function loadTasks() {
   if (!currentCourse) return;
   const box = document.getElementById("tasks");
   box.innerHTML = "";
+
   const url = new URL(`${API_BASE}/students/${studentId}/tasks`);
   url.searchParams.set("course", currentCourse);
   const res = await fetch(url.toString());
   const data = await res.json();
 
+  // group tasks by (course, event_idx, topic)
   const groups = {};
   data.forEach(t => {
     const key = `${t.course}#${t.event_idx}#${t.topic}`;
@@ -176,40 +178,46 @@ async function loadTasks() {
 
   Object.entries(groups).forEach(([key, tasks]) => {
     const [course, idx, topic] = key.split("#");
-    const header = el("div", {class:"group-header", style:"margin:8px 0; font-weight:600;"}, `${course} — ${topic}`);
+
+    // group header (course — topic)
+    const header = el("div", {
+      class: "group-header",
+      style: "margin:12px 0 6px; font-weight:700; font-size:16px;"
+    }, `${course} — ${topic}`);
     box.appendChild(header);
+
+    // task rows (checkbox + title + due + hours)
     tasks.forEach(t => {
-      const row = el("div", {class:"task-row", style:"display:flex; align-items:center; gap:8px; margin:6px 0;"});
-      const checkbox = el("input", {type:"checkbox"});
+      const row = el("div", { class: "task-row", style: "display:flex; align-items:center; gap:10px; margin:6px 0;" });
+
+      const checkbox = el("input", { type: "checkbox" });
       checkbox.checked = t.status === "done" || t.completion_percent === 100;
+
       checkbox.addEventListener("change", async () => {
         const status = checkbox.checked ? "done" : "not_started";
-        await updateTask(t.id, status, checkbox.checked ? 100 : 0);
-        await loadProgress();
+        // backend auto-sets completion_percent = 100 for "done", 0 otherwise
+        await updateTask(t.id, status, null);
+        await loadProgress(); // refresh aggregate bars
       });
+
       const title = el("div", {}, t.title);
-      const due = el("div", {class:"badge"}, t.due_date);
-      const pct = el("input", {type:"number", min:"0", max:"100", value:String(t.completion_percent), style:"width:72px;"});
-      pct.addEventListener("change", async () => {
-        await updateTask(t.id, null, parseInt(pct.value || "0", 10));
-        await loadProgress();
-      });
+      const due = el("div", { class: "badge" }, t.due_date);
+      const hrs = el("div", {}, `hrs:${t.hours}`);
+
       row.appendChild(checkbox);
       row.appendChild(title);
       row.appendChild(due);
-      row.appendChild(el("div", {}, "hrs:", String(t.hours)));
-      row.appendChild(el("div", {}, "progress:"));
-      row.appendChild(pct);
-      row.appendChild(el("div", {}, "%"));
+      row.appendChild(hrs);
       box.appendChild(row);
     });
   });
 }
 
-async function updateTask(taskId, status=null, pct=null) {
+
+async function updateTask(taskId, status = null, pct = null) {
   const url = new URL(`${API_BASE}/students/${studentId}/tasks/${taskId}`);
   if (status) url.searchParams.set("status", status);
-  if (pct !== null) url.searchParams.set("completion_percent", String(pct));
+  // pct is ignored now; backend derives % from status
   const res = await fetch(url.toString(), { method: "PATCH" });
   if (!res.ok) {
     console.error(await res.text());
@@ -217,24 +225,51 @@ async function updateTask(taskId, status=null, pct=null) {
   }
 }
 
+// Topic-only progress: aggregate tasks by topic (within the selected course)
 async function loadProgress() {
   if (!currentCourse) return;
+
   const box = document.getElementById("progress");
   box.innerHTML = "";
-  const url = new URL(`${API_BASE}/students/${studentId}/progress`);
+
+  // Pull tasks for the selected course, then compute progress per TOPIC
+  const url = new URL(`${API_BASE}/students/${studentId}/tasks`);
   url.searchParams.set("course", currentCourse);
   const res = await fetch(url.toString());
-  const data = await res.json();
-  data.sort((a, b) => a.event_idx - b.event_idx);
-  data.forEach(r => {
-    const outer = el("div", {style:"margin:8px 0;"});
-    outer.appendChild(el("div", {}, `${r.course} - ${r.topic} (due ${r.due_date})`));
-    const bar = el("div", {class:"progress-bar"});
-    const fill = el("div", {class:"progress-fill", style:`width:${r.completion_percent}%;`});
+  const tasks = await res.json();
+
+  if (tasks.length === 0) {
+    box.appendChild(el("div", { style: "opacity:.8" }, "No plan yet for this course. Click Generate Plan."));
+    return;
+  }
+
+  // Group tasks by topic
+  const byTopic = {};
+  tasks.forEach(t => {
+    const topic = t.topic;
+    if (!byTopic[topic]) byTopic[topic] = [];
+    byTopic[topic].push(t);
+  });
+
+  // Render one row per topic with a single progress bar
+  Object.entries(byTopic).forEach(([topic, arr]) => {
+    const total = arr.length;
+    const completed = arr.filter(x => x.status === "done" || (x.completion_percent || 0) >= 100).length;
+    const avgPct = Math.round(arr.reduce((s, x) => s + (x.completion_percent || 0), 0) / total);
+
+    const wrap = el("div", { style: "margin:10px 0;" });
+    wrap.appendChild(el("div", { style: "font-weight:600" }, topic));
+
+    const bar = el("div", { class: "progress-bar" });
+    const fill = el("div", { class: "progress-fill", style: `width:${avgPct}%;` });
     bar.appendChild(fill);
-    outer.appendChild(bar);
-    outer.appendChild(el("div", {style:"font-size:12px; opacity:0.8;"}, `${r.completed_tasks}/${r.total_tasks} tasks complete - ${r.completion_percent}%`));
-    box.appendChild(outer);
+    wrap.appendChild(bar);
+
+    wrap.appendChild(
+      el("div", { style: "font-size:12px; opacity:.8;" }, `${completed}/${total} tasks complete • ${avgPct}%`)
+    );
+
+    box.appendChild(wrap);
   });
 }
 

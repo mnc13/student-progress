@@ -102,21 +102,29 @@ def update_task(
         raise HTTPException(status_code=404, detail="task not found")
 
     changed = False
-    if status:
+
+    # If status is provided, set both status and derived completion_percent
+    if status is not None:
         if status not in {"not_started", "in_progress", "done"}:
             raise HTTPException(status_code=400, detail="invalid status")
         t.status = status
         if status == "done":
             t.completion_percent = 100
+        elif status == "not_started":
+            t.completion_percent = 0
+        # for in_progress, keep current percent unless an explicit percent is sent
         changed = True
 
+    # If an explicit percent is sent, normalize and adjust status accordingly
     if completion_percent is not None:
         if not (0 <= completion_percent <= 100):
             raise HTTPException(status_code=400, detail="invalid completion_percent")
         t.completion_percent = completion_percent
         if completion_percent == 100:
             t.status = "done"
-        elif completion_percent > 0 and t.status == "not_started":
+        elif completion_percent == 0:
+            t.status = "not_started"
+        else:
             t.status = "in_progress"
         changed = True
 
@@ -124,8 +132,15 @@ def update_task(
         db.add(t); db.commit(); db.refresh(t)
 
     return {
-        "id": t.id, "event_idx": t.event_idx, "course": t.course, "title": t.title, "topic": t.topic,
-        "due_date": t.due_date, "hours": t.hours, "status": t.status, "completion_percent": t.completion_percent
+        "id": t.id,
+        "event_idx": t.event_idx,
+        "course": t.course,
+        "title": t.title,
+        "topic": t.topic,
+        "due_date": t.due_date,
+        "hours": t.hours,
+        "status": t.status,
+        "completion_percent": t.completion_percent,
     }
 
 @router.get("/{student_id}/progress", response_model=List[ProgressSummary])
