@@ -23,6 +23,9 @@ export function Header() {
         />
       </div>
 
+      {/* Spacer to push items to the right */}
+      <div className="flex-1" />
+
       {/* Theme Toggle */}
       <div className="flex items-center gap-1 bg-background rounded-full p-1">
         <Button
@@ -42,6 +45,9 @@ export function Header() {
           <Moon className="w-4 h-4" />
         </Button>
       </div>
+
+      {/* Spacer between theme toggle and notifications */}
+      <div className="w-4" />
 
       {/* Notifications */}
       <Button variant="ghost" size="icon" className="relative">
