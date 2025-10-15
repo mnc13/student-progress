@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException
 from typing import List, Dict
 from sqlalchemy.orm import Session
-from sqlalchemy import select, func
+from sqlalchemy import select, func, case
 
 from app.models.db import SessionLocal
 from app.models.entities import Student, PastItem, UpcomingEvent, StudyTask
@@ -103,16 +103,20 @@ def update_task(student_id: int, task_id: int, status: str | None = None, comple
 @router.get("/{student_id}/progress", response_model=List[ProgressSummary])
 def progress(student_id: int, db: Session = Depends(get_db)):
     _ensure_student(db, student_id)
-    # Aggregate per (event_idx, course, topic, due_date)
     rows = db.execute(
         select(
-            StudyTask.event_idx, StudyTask.course, StudyTask.topic, StudyTask.due_date,
+            StudyTask.event_idx,
+            StudyTask.course,
+            StudyTask.topic,
+            StudyTask.due_date,
             func.coalesce(func.avg(StudyTask.completion_percent), 0).label("avg_pct"),
             func.count(StudyTask.id).label("cnt"),
-            func.sum(func.case((StudyTask.status == "done", 1), else_=0)).label("done_cnt")
-        ).where(StudyTask.student_id == student_id)
-         .group_by(StudyTask.event_idx, StudyTask.course, StudyTask.topic, StudyTask.due_date)
+            func.sum(case((StudyTask.status == "done", 1), else_=0)).label("done_cnt"),
+        )
+        .where(StudyTask.student_id == student_id)
+        .group_by(StudyTask.event_idx, StudyTask.course, StudyTask.topic, StudyTask.due_date)
     ).all()
+
     out = []
     for r in rows:
         out.append({
@@ -120,8 +124,8 @@ def progress(student_id: int, db: Session = Depends(get_db)):
             "course": r[1],
             "topic": r[2],
             "due_date": r[3],
-            "completion_percent": int(round(r[4])),
+            "completion_percent": int(round(r[4] or 0)),
             "completed_tasks": int(r[6] or 0),
-            "total_tasks": int(r[5] or 0)
+            "total_tasks": int(r[5] or 0),
         })
     return out
