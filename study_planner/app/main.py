@@ -54,19 +54,4 @@ app.include_router(students.router)
 def health():
     return {"ok": True, "app": settings.APP_NAME}
 
-# ---------- FRONTEND (Static) ----------
-# Serve the UI from app/frontend/
-_frontend_dir = Path(__file__).resolve().parent.parent / "frontend"
-if _frontend_dir.exists():
-    # Mount under /frontend (won't interfere with /docs or API paths)
-    app.mount("/frontend", StaticFiles(directory=_frontend_dir, html=True), name="frontend")
 
-    # Redirect root to the SPA
-    @app.get("/")
-    def root_redirect():
-        return RedirectResponse(url="/frontend/")
-else:
-    # If no frontend folder, keep a simple root so "/" isn't 404
-    @app.get("/")
-    def root_ok():
-        return {"ok": True}
