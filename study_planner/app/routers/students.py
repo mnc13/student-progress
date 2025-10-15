@@ -71,6 +71,7 @@ def generate_plan(student_id: int, course: str = Query(...), db: Session = Depen
     db.commit()
 
     created = generate_study_tasks(db, student_id, course=course)
+    db.refresh(*created)  # Refresh to ensure attributes are loaded
     return {"created_tasks": [{
         "id": t.id, "event_idx": t.event_idx, "course": t.course, "title": t.title, "topic": t.topic,
         "due_date": t.due_date, "hours": t.hours, "status": t.status, "completion_percent": t.completion_percent
