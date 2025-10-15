@@ -1,6 +1,7 @@
 const API_BASE = "http://localhost:8000";
 
 let studentId = null;
+let currentCourse = null;
 let calendar = null;
 
 function el(tag, attrs = {}, ...children) {
@@ -17,6 +18,11 @@ function el(tag, attrs = {}, ...children) {
   return e;
 }
 
+function setGenerateEnabled(on) {
+  const btn = document.getElementById("genPlanBtn");
+  btn.disabled = !on;
+}
+
 async function login() {
   const val = document.getElementById("studentIdInput").value.trim();
   if (!val) return;
@@ -26,34 +32,50 @@ async function login() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ student_id: parseInt(val, 10) })
     });
-    if (!res.ok) throw new Error("Login failed");
+    if (!res.ok) throw new Error(await res.text());
     const data = await res.json();
     studentId = data.student_id;
     document.getElementById("loginStatus").textContent = `Logged in as ${studentId}`;
-    await refreshAll();
+    await loadCourses();
+    // auto-select first course
+    const first = document.querySelector("#courses li");
+    if (first) first.click();
   } catch (e) {
-    document.getElementById("loginStatus").textContent = e.message;
+    document.getElementById("loginStatus").textContent = e.message || "Login failed";
   }
-}
-
-async function refreshAll() {
-  if (!studentId) return;
-  await loadCourses();
-  await loadUpcoming();
-  await loadTasks();
-  await loadProgress();
 }
 
 async function loadCourses() {
   const ul = document.getElementById("courses");
   ul.innerHTML = "";
+  setGenerateEnabled(false);
+
   const res = await fetch(`${API_BASE}/students/${studentId}/courses`);
   const data = await res.json();
+
   data.forEach(c => {
-    const li = el("li", {}, c.course, el("span", {class:"badge", style:"margin-left:8px"}, "view past"));
-    li.addEventListener("click", () => loadPast(c.course));
+    const li = el("li", {}, c.course, el("span", {class:"badge", style:"margin-left:8px"}, "select"));
+    li.addEventListener("click", async () => {
+      document.querySelectorAll("#courses li").forEach(x => x.classList.remove("selected"));
+      li.classList.add("selected");
+      currentCourse = c.course;
+      document.getElementById("selectedCourse").textContent = `Course: ${currentCourse}`;
+      setGenerateEnabled(true);
+      await loadPast(currentCourse);
+      await refreshCourseScoped();
+    });
     ul.appendChild(li);
   });
+
+  // Auto-select first course so currentCourse is not null
+  const first = document.querySelector("#courses li");
+  if (first) first.click();
+}
+
+async function refreshCourseScoped() {
+  await loadUpcoming();
+  await loadTasks();
+  await loadProgress();
 }
 
 async function loadPast(course) {
@@ -74,9 +96,12 @@ async function loadPast(course) {
 }
 
 async function loadUpcoming() {
-  const res = await fetch(`${API_BASE}/students/${studentId}/upcoming`);
+  if (!currentCourse) return;
+  const url = new URL(`${API_BASE}/students/${studentId}/upcoming`);
+  url.searchParams.set("course", currentCourse);
+  const res = await fetch(url.toString());
   const events = await res.json();
-  // Init FullCalendar
+
   const calendarEl = document.getElementById('calendar');
   if (!calendar) {
     calendar = new FullCalendar.Calendar(calendarEl, {
@@ -88,45 +113,70 @@ async function loadUpcoming() {
   }
   calendar.removeAllEvents();
   events.forEach(ev => {
-    calendar.addEvent({
-      title: `${ev.course}: ${ev.topic}`,
-      start: ev.date,
-      allDay: true
-    });
+    calendar.addEvent({ title: `${ev.course}: ${ev.topic}`, start: ev.date, allDay: true });
   });
 }
 
 async function generatePlan() {
-  if (!studentId) return;
+  if (!studentId) return alert("Log in first.");
+
+  // If, for any reason, currentCourse isn’t set, try reading it from the selected list item
+  const selectedLi = document.querySelector("#courses li.selected");
+  if (selectedLi) currentCourse = selectedLi.firstChild.nodeValue.trim();
+
+  if (!currentCourse) return alert("Select a course first (click a course in the list).");
+
   const btn = document.getElementById("genPlanBtn");
   btn.disabled = true; btn.textContent = "Generating...";
+
   try {
-    const res = await fetch(`${API_BASE}/students/${studentId}/study-plan/generate`, { method: "POST" });
-    if (!res.ok) throw new Error("Failed to generate plan");
+    const url = new URL(`${API_BASE}/students/${studentId}/study-plan/generate`);
+    url.searchParams.set("course", currentCourse);   // <-- REQUIRED
+    console.log("POST", url.toString());
+
+    const res = await fetch(url.toString(), { method: "POST" });
+    const text = await res.text().catch(() => "");
+
+    console.log("STATUS", res.status, text);
+
+    if (!res.ok) {
+      alert(`Failed to generate plan (${res.status})\n\n${text}`);
+      return;
+    }
+
+    const data = text ? JSON.parse(text) : {};
+    if (!data.created_tasks || data.created_tasks.length === 0) {
+      alert(`No upcoming events found for "${currentCourse}".`);
+    }
+
     await loadTasks();
     await loadProgress();
   } catch (e) {
-    alert(e.message);
+    alert(e?.message || "Failed to generate plan");
   } finally {
     btn.disabled = false; btn.textContent = "Generate Plan";
   }
 }
 
 async function loadTasks() {
+  if (!currentCourse) return;
   const box = document.getElementById("tasks");
   box.innerHTML = "";
-  const res = await fetch(`${API_BASE}/students/${studentId}/tasks`);
+  const url = new URL(`${API_BASE}/students/${studentId}/tasks`);
+  url.searchParams.set("course", currentCourse);
+  const res = await fetch(url.toString());
   const data = await res.json();
-  // Group by (course, event_idx, topic)
+
   const groups = {};
   data.forEach(t => {
     const key = `${t.course}#${t.event_idx}#${t.topic}`;
     if (!groups[key]) groups[key] = [];
     groups[key].push(t);
   });
+
   Object.entries(groups).forEach(([key, tasks]) => {
     const [course, idx, topic] = key.split("#");
-    const header = el("div", {class:"group-header", style:"margin:8px 0; font-weight:600;"}, `${course} – upc_item${idx} – ${topic}`);
+    const header = el("div", {class:"group-header", style:"margin:8px 0; font-weight:600;"}, `${course} — ${topic}`);
     box.appendChild(header);
     tasks.forEach(t => {
       const row = el("div", {class:"task-row", style:"display:flex; align-items:center; gap:8px; margin:6px 0;"});
@@ -168,19 +218,22 @@ async function updateTask(taskId, status=null, pct=null) {
 }
 
 async function loadProgress() {
+  if (!currentCourse) return;
   const box = document.getElementById("progress");
   box.innerHTML = "";
-  const res = await fetch(`${API_BASE}/students/${studentId}/progress`);
+  const url = new URL(`${API_BASE}/students/${studentId}/progress`);
+  url.searchParams.set("course", currentCourse);
+  const res = await fetch(url.toString());
   const data = await res.json();
   data.sort((a, b) => a.event_idx - b.event_idx);
   data.forEach(r => {
     const outer = el("div", {style:"margin:8px 0;"});
-    outer.appendChild(el("div", {}, `${r.course} – upc_item${r.event_idx} – ${r.topic} (due ${r.due_date})`));
+    outer.appendChild(el("div", {}, `${r.course} - ${r.topic} (due ${r.due_date})`));
     const bar = el("div", {class:"progress-bar"});
     const fill = el("div", {class:"progress-fill", style:`width:${r.completion_percent}%;`});
     bar.appendChild(fill);
     outer.appendChild(bar);
-    outer.appendChild(el("div", {style:"font-size:12px; opacity:0.8;"}, `${r.completed_tasks}/${r.total_tasks} tasks complete • ${r.completion_percent}%`));
+    outer.appendChild(el("div", {style:"font-size:12px; opacity:0.8;"}, `${r.completed_tasks}/${r.total_tasks} tasks complete - ${r.completion_percent}%`));
     box.appendChild(outer);
   });
 }

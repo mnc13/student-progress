@@ -17,6 +17,8 @@ th, td { padding: 8px; border-bottom: 1px solid #223; }
 .progress-fill { height: 100%; background: #22c55e; }
 #calendar { background: #111827; padding: 8px; border-radius: 12px; }
 #loginStatus { margin-left: 8px; opacity: 0.8; }
+#courses li.selected { background: #1f2937; outline: 1px solid #3b82f6; }
+
 @media (max-width: 900px) {
   .grid { grid-template-columns: 1fr; }
 }
