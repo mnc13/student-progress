@@ -105,7 +105,7 @@ export function CalendarWidget() {
   return (
     <Card className="shadow-xl shadow-blue-200/60">
       <CardHeader className="flex flex-row items-center justify-between">
-        <CardTitle className="text-lg font-semibold">My Progress</CardTitle>
+        <CardTitle className="text-lg font-semibold">My Calendar</CardTitle>
         <div className="flex items-center gap-2">
           <button
             onClick={() => navigateMonth('prev')}

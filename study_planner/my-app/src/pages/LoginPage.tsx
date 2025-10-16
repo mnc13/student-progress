@@ -20,6 +20,7 @@ const LoginPage = () => {
       if (!response.ok) throw new Error("Login failed");
       const data = await response.json();
       login(data.student_id.toString());
+      // Don't set selectedCourse here - let it be set by the Sidebar component
       navigate("/");
     } catch (error) {
       alert("Login failed: " + error.message);
