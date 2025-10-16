@@ -14,13 +14,13 @@ export function WelcomeCard() {
 
       <div className="relative z-10 flex items-center justify-between">
         <div className="flex-1">
-          <h1 className="text-3xl font-bold text-white mb-3 flex items-center gap-2">
+          <h1 className="text-2xl font-bold text-white mb-3 flex items-center gap-2">
             Welcome back, Student {studentId} <span className="inline-block animate-bounce">👋</span>
           </h1>
-          <p className="text-white/90 text-lg">
+          <p className="text-white/90 text-base">
             You're doing <span className="font-bold">GREAT</span>!
           </p>
-          <p className="text-white/80">Keep it up and improve your progress.</p>
+          <p className="text-white/80 text-sm">Keep it up and improve your progress.</p>
         </div>
 
         {/* Illustration */}
