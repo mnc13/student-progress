@@ -2,13 +2,19 @@ import { useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 
-const LoginForm = () => {
+interface LoginFormProps {
+  onLogin: (studentId: string) => void;
+  isLoading: boolean;
+}
+
+const LoginForm = ({ onLogin, isLoading }: LoginFormProps) => {
   const [studentId, setStudentId] = useState("");
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
-    console.log("Login attempted with:", studentId);
-    // Add login logic here
+    if (studentId.trim()) {
+      onLogin(studentId.trim());
+    }
   };
 
   return (
@@ -26,15 +32,17 @@ const LoginForm = () => {
             placeholder="Student ID"
             value={studentId}
             onChange={(e) => setStudentId(e.target.value)}
+            disabled={isLoading}
             className="w-full px-0 pb-3 pt-1 bg-transparent border-0 border-b-2 border-primary rounded-none focus-visible:ring-0 focus-visible:border-primary placeholder:text-muted-foreground text-base"
           />
         </div>
 
         <Button
           type="submit"
+          disabled={isLoading || !studentId.trim()}
           className="w-full bg-primary hover:bg-primary/90 text-white font-medium text-base py-6 rounded-md transition-all duration-200"
         >
-          login
+          {isLoading ? "Logging in..." : "login"}
         </Button>
       </form>
     </div>

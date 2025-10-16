@@ -2,8 +2,8 @@
 from datetime import timedelta, date
 from typing import List, Dict, Any
 
-from sqlalchemy.orm import Session            # ✅ you were missing this
-from sqlalchemy import select, delete         # ✅ used for idempotency
+from sqlalchemy.orm import Session            
+from sqlalchemy import select, delete         
 
 from app.models.entities import PastItem, UpcomingEvent, StudyTask
 from app.core.config import settings
@@ -94,15 +94,6 @@ def generate_study_tasks(db: Session, student_id: int, course: str, model: str |
     created: list[StudyTask] = []
 
     for upc in upcomings:
-        # Clear any existing tasks for this event to avoid duplicates
-        db.execute(
-            delete(StudyTask).where(
-                StudyTask.student_id == student_id,
-                StudyTask.course == course,
-                StudyTask.event_idx == upc.idx,
-            )
-        )
-
         user_prompt = {
             "role": "user",
             "content": f"""
@@ -140,6 +131,7 @@ Respond with JSON ONLY in this exact schema:
                 completion_percent=0,
             )
             db.add(task)
+            db.flush()  # Assign id immediately
             created.append(task)
 
     db.commit()

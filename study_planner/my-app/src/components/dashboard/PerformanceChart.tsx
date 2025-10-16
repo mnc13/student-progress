@@ -1,58 +1,69 @@
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Area, AreaChart, ResponsiveContainer, XAxis, YAxis, Tooltip, CartesianGrid } from "recharts";
-import { ChevronDown } from "lucide-react";
-
-const data = [
-  { x: 1, value: 3 },
-  { x: 1.5, value: 2 },
-  { x: 2, value: 2.5 },
-  { x: 2.5, value: 2 },
-  { x: 3, value: 3.5 },
-  { x: 3.5, value: 3 },
-  { x: 4, value: 2 },
-];
+import { useAuth } from "@/contexts/AuthContext";
+import { api } from "@/lib/api";
+import { useQuery } from "@tanstack/react-query";
 
 export function PerformanceChart() {
+  const { studentId, selectedCourse } = useAuth();
+
+  const { data: pastItems, isLoading } = useQuery({
+    queryKey: ["pastItems", studentId, selectedCourse],
+    queryFn: () => studentId && selectedCourse ? api.getPastItems(parseInt(studentId), selectedCourse) : Promise.resolve([]),
+    enabled: !!studentId && !!selectedCourse,
+  });
+
+  const chartData = pastItems ? pastItems.map((item: any) => ({
+    x: item.idx,
+    value: item.percent / 100,
+  })) : [];
+
   return (
-    <Card>
-      <CardHeader className="flex flex-row items-center justify-between">
-        <CardTitle className="text-lg font-semibold">Performance</CardTitle>
-        <button className="flex items-center gap-1 text-sm text-muted-foreground hover:text-foreground">
-          Overall <ChevronDown className="w-4 h-4" />
-        </button>
+    <Card className="h-96 shadow-xl shadow-blue-200/60">
+      <CardHeader>
+        <CardTitle className="text-lg font-semibold">Performance - {selectedCourse || "Overall"}</CardTitle>
       </CardHeader>
-      <CardContent>
-        <ResponsiveContainer width="100%" height={200}>
-          <AreaChart data={data}>
-            <defs>
-              <linearGradient id="colorValue" x1="0" y1="0" x2="0" y2="1">
-                <stop offset="5%" stopColor="hsl(var(--primary))" stopOpacity={0.3} />
-                <stop offset="95%" stopColor="hsl(var(--primary))" stopOpacity={0} />
-              </linearGradient>
-            </defs>
-            <CartesianGrid strokeDasharray="3 3" stroke="hsl(var(--border))" />
-            <XAxis 
-              dataKey="x" 
-              axisLine={false}
-              tickLine={false}
-              tick={{ fill: 'hsl(var(--muted-foreground))' }}
-            />
-            <YAxis 
-              domain={[0, 4]}
-              axisLine={false}
-              tickLine={false}
-              tick={{ fill: 'hsl(var(--muted-foreground))' }}
-            />
-            <Tooltip />
-            <Area
-              type="monotone"
-              dataKey="value"
-              stroke="hsl(var(--primary))"
-              strokeWidth={2}
-              fill="url(#colorValue)"
-            />
-          </AreaChart>
-        </ResponsiveContainer>
+      <CardContent className="flex-1 flex items-end justify-center pb-4">
+        {isLoading ? (
+          <div className="h-[200px] flex items-center justify-center text-muted-foreground">Loading...</div>
+        ) : chartData.length === 0 ? (
+          <div className="h-[200px] flex items-center justify-center text-muted-foreground">No data available</div>
+        ) : (
+          <div className="w-full h-[200px]">
+            <ResponsiveContainer width="100%" height="100%">
+              <AreaChart data={chartData}>
+                <defs>
+                  <linearGradient id="colorValue" x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="5%" stopColor="hsl(var(--primary))" stopOpacity={0.3} />
+                    <stop offset="95%" stopColor="hsl(var(--primary))" stopOpacity={0} />
+                  </linearGradient>
+                </defs>
+                <CartesianGrid strokeDasharray="3 3" stroke="hsl(var(--border))" />
+                <XAxis
+                  dataKey="x"
+                  axisLine={false}
+                  tickLine={false}
+                  tick={{ fill: 'hsl(var(--muted-foreground))' }}
+                />
+                <YAxis
+                  domain={[0, 1]}
+                  axisLine={false}
+                  tickLine={false}
+                  tick={{ fill: 'hsl(var(--muted-foreground))' }}
+                  tickFormatter={(value) => `${(value * 100).toFixed(0)}%`}
+                />
+                <Tooltip />
+                <Area
+                  type="monotone"
+                  dataKey="value"
+                  stroke="hsl(var(--primary))"
+                  strokeWidth={2}
+                  fill="url(#colorValue)"
+                />
+              </AreaChart>
+            </ResponsiveContainer>
+          </div>
+        )}
       </CardContent>
     </Card>
   );

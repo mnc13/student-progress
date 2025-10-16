@@ -1,11 +1,7 @@
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-
-const subjects = [
-  { name: "General Histology", progress: 79, color: "hsl(var(--primary))" },
-  { name: "Living (surface) Anatomy", progress: 91, color: "hsl(var(--success))" },
-  { name: "Neuroanatomy", progress: 25, color: "hsl(var(--danger))" },
-  { name: "Regional Anatomy: ABDOMEN", progress: 97, color: "hsl(var(--info))" },
-];
+import { useAuth } from "@/contexts/AuthContext";
+import { api } from "@/lib/api";
+import { useQuery } from "@tanstack/react-query";
 
 function CircularProgress({ progress, color }: { progress: number; color: string }) {
   const radius = 30;
@@ -44,18 +40,56 @@ function CircularProgress({ progress, color }: { progress: number; color: string
 }
 
 export function CompletionProgress() {
+  const { studentId, selectedCourse } = useAuth();
+
+  const { data: progressData, isLoading } = useQuery({
+    queryKey: ["progress", studentId, selectedCourse],
+    queryFn: () => studentId ? api.getProgress(parseInt(studentId), selectedCourse || undefined) : Promise.resolve([]),
+    enabled: !!studentId,
+  });
+
+  // Group by topic and calculate weighted average completion percentage
+  const uniqueTopics = progressData ? progressData.reduce((acc: any, item: any) => {
+    if (!acc[item.topic]) {
+      acc[item.topic] = {
+        topic: item.topic,
+        totalTasks: 0,
+        completedTasks: 0,
+        totalWeight: 0,
+        weightedSum: 0
+      };
+    }
+    acc[item.topic].totalTasks += item.total_tasks;
+    acc[item.topic].completedTasks += item.completed_tasks;
+    acc[item.topic].totalWeight += item.total_tasks;
+    acc[item.topic].weightedSum += (item.completion_percent * item.total_tasks);
+    return acc;
+  }, {}) : {};
+
+  // Calculate final completion percentage for each topic
+  Object.keys(uniqueTopics).forEach(topic => {
+    const data = uniqueTopics[topic];
+    data.completion_percent = data.totalWeight > 0 ? Math.round(data.weightedSum / data.totalWeight) : 0;
+  });
+
   return (
-    <Card className="flex flex-col h-full">
+    <Card className="flex flex-col h-96 shadow-xl shadow-blue-200/60">
       <CardHeader className="flex-shrink-0">
         <CardTitle className="text-lg font-semibold">Completion Progress</CardTitle>
       </CardHeader>
       <CardContent className="flex-1 overflow-y-auto space-y-4">
-        {subjects.map((subject) => (
-          <div key={subject.name} className="flex items-center justify-between">
-            <span className="text-sm font-medium flex-1">{subject.name}</span>
-            <CircularProgress progress={subject.progress} color={subject.color} />
-          </div>
-        ))}
+        {isLoading ? (
+          <div className="text-center text-muted-foreground">Loading...</div>
+        ) : Object.keys(uniqueTopics).length > 0 ? (
+          Object.values(uniqueTopics).map((item: any) => (
+            <div key={item.topic} className="flex items-center justify-between">
+              <span className="text-sm font-medium flex-1">{item.topic}</span>
+              <CircularProgress progress={item.completion_percent} color="hsl(var(--primary))" />
+            </div>
+          ))
+        ) : (
+          <div className="text-center text-muted-foreground">No progress data available</div>
+        )}
       </CardContent>
     </Card>
   );
