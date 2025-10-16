@@ -23,9 +23,10 @@ export const api = {
     return res.json();
   },
 
-  getUpcomingEvents: async (studentId: number, course?: string) => {
+  getUpcomingEvents: async (studentId: number, course?: string, includePast?: boolean) => {
     const url = new URL(`${API_BASE}/students/${studentId}/upcoming`);
     if (course) url.searchParams.set("course", course);
+    if (includePast) url.searchParams.set("include_past", "true");
     const res = await fetch(url.toString());
     if (!res.ok) throw new Error("Failed to fetch upcoming events");
     return res.json();

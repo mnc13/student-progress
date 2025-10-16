@@ -17,8 +17,8 @@ export function CalendarWidget() {
   const [isYearPopoverOpen, setIsYearPopoverOpen] = useState(false);
 
   const { data: upcomingEvents, isLoading } = useQuery({
-    queryKey: ["upcomingEvents", studentId, selectedCourse],
-    queryFn: () => studentId ? api.getUpcomingEvents(parseInt(studentId), selectedCourse || undefined) : Promise.resolve([]),
+    queryKey: ["upcomingEvents", studentId, selectedCourse, "withPast"],
+    queryFn: () => studentId ? api.getUpcomingEvents(parseInt(studentId), selectedCourse || undefined, true) : Promise.resolve([]),
     enabled: !!studentId,
   });
 
@@ -58,17 +58,21 @@ export function CalendarWidget() {
     highlightedDates[todayDate] = "bg-blue-500 text-white font-bold";
   }
 
-  // Mark upcoming events with pink color, but red for exam days (today's events)
+  // Mark upcoming events with pink color, past events with green color, and red for exam days (today's events)
   if (upcomingEvents) {
     upcomingEvents.forEach((event: any) => {
       const eventDate = new Date(event.date);
       if (eventDate.getMonth() === month && eventDate.getFullYear() === year) {
         const day = eventDate.getDate();
         const isToday = isCurrentMonth && day === todayDate;
+        const isPast = eventDate < today;
 
         if (isToday) {
           // Exam day - red color takes priority
           highlightedDates[day] = "bg-red-500 text-white font-bold";
+        } else if (isPast) {
+          // Past event - green color
+          highlightedDates[day] = "bg-green-500 text-white font-bold";
         } else {
           // Regular upcoming event - pink color
           highlightedDates[day] = "bg-pink-500 text-white font-bold";
