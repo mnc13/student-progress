@@ -36,6 +36,8 @@ export function Sidebar() {
 
   const handleCourseSelect = (course: string) => {
     setSelectedCourse(course);
+    // Invalidate queries to refresh data for the new course
+    // This will be handled by React Query's query invalidation
   };
 
   const handleLogout = () => {

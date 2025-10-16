@@ -5,16 +5,18 @@ import { useAuth } from "@/contexts/AuthContext";
 import { api } from "@/lib/api";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { Button } from "@/components/ui/button";
-import { useEffect } from "react";
+import { useEffect, useRef } from "react";
 
 export function YourPlan() {
   const { studentId, selectedCourse } = useAuth();
   const queryClient = useQueryClient();
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const scrollPositionRef = useRef<number>(0);
 
-  const { data: tasks, isLoading } = useQuery({
+  const { data: tasks, isLoading, isFetching } = useQuery({
     queryKey: ["tasks", studentId, selectedCourse],
     queryFn: () => studentId ? api.getTasks(parseInt(studentId), selectedCourse || undefined) : Promise.resolve([]),
-    enabled: !!studentId,
+    enabled: !!studentId && !!selectedCourse,
   });
 
   const generatePlanMutation = useMutation({
@@ -26,21 +28,52 @@ export function YourPlan() {
 
   // Auto-generate plan if no tasks exist for the selected course
   useEffect(() => {
-    if (studentId && selectedCourse && tasks && tasks.length === 0 && !isLoading) {
-      generatePlanMutation.mutate();
+    if (studentId && selectedCourse && !isLoading && !isFetching && !generatePlanMutation.isPending) {
+      // Only generate if we have data and it's empty, or if query completed with no data
+      const shouldGenerate = !tasks || (Array.isArray(tasks) && tasks.length === 0);
+      if (shouldGenerate) {
+        generatePlanMutation.mutate();
+      }
     }
-  }, [studentId, selectedCourse, tasks, isLoading, generatePlanMutation]);
+  }, [studentId, selectedCourse, tasks, isLoading, isFetching, generatePlanMutation]);
 
   const updateTaskMutation = useMutation({
     mutationFn: ({ taskId, status }: { taskId: number; status: string }) =>
       api.updateTask(parseInt(studentId!), taskId, { status }),
+    onMutate: async ({ taskId, status }) => {
+      // Cancel any outgoing refetches
+      await queryClient.cancelQueries({ queryKey: ["tasks", studentId, selectedCourse] });
+
+      // Snapshot the previous value
+      const previousTasks = queryClient.getQueryData(["tasks", studentId, selectedCourse]);
+
+      // Optimistically update to the new value
+      queryClient.setQueryData(["tasks", studentId, selectedCourse], (old: any) => {
+        if (!old) return old;
+        return old.map((task: any) =>
+          task.id === taskId ? { ...task, status } : task
+        );
+      });
+
+      // Return a context object with the snapshotted value
+      return { previousTasks };
+    },
+    onError: (err, { taskId, status }, context) => {
+      // If the mutation fails, use the context returned from onMutate to roll back
+      if (context?.previousTasks) {
+        queryClient.setQueryData(["tasks", studentId, selectedCourse], context.previousTasks);
+      }
+    },
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["tasks", studentId, selectedCourse] });
       queryClient.invalidateQueries({ queryKey: ["progress", studentId, selectedCourse] });
     },
   });
 
   const handleTaskUpdate = (taskId: number, status: string) => {
+    // Store current scroll position before mutation
+    if (scrollRef.current) {
+      scrollPositionRef.current = scrollRef.current.scrollTop;
+    }
     updateTaskMutation.mutate({ taskId, status });
   };
 
@@ -59,8 +92,8 @@ export function YourPlan() {
       <CardHeader className="flex-shrink-0">
         <CardTitle className="text-lg font-semibold">Your Plan</CardTitle>
       </CardHeader>
-      <CardContent className="overflow-y-auto max-h-[400px] space-y-4">
-        {isLoading ? (
+      <CardContent ref={scrollRef} className="overflow-y-auto max-h-[400px] space-y-4">
+        {(isLoading || isFetching) ? (
           <div className="text-center text-muted-foreground">Loading...</div>
         ) : Object.keys(groupedTasks).length > 0 ? (
           Object.entries(groupedTasks).map(([topic, topicTasks]) => (

@@ -16,8 +16,12 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
 
   useEffect(() => {
     const storedStudentId = localStorage.getItem("student_id");
+    const storedCourse = localStorage.getItem("selected_course");
     if (storedStudentId) {
       setStudentId(storedStudentId);
+    }
+    if (storedCourse) {
+      setSelectedCourse(storedCourse);
     }
   }, []);
 
@@ -30,10 +34,20 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
     setStudentId(null);
     setSelectedCourse(null);
     localStorage.removeItem("student_id");
+    localStorage.removeItem("selected_course");
+  };
+
+  const updateSelectedCourse = (course: string | null) => {
+    setSelectedCourse(course);
+    if (course) {
+      localStorage.setItem("selected_course", course);
+    } else {
+      localStorage.removeItem("selected_course");
+    }
   };
 
   return (
-    <AuthContext.Provider value={{ studentId, selectedCourse, login, logout, setSelectedCourse }}>
+    <AuthContext.Provider value={{ studentId, selectedCourse, login, logout, setSelectedCourse: updateSelectedCourse }}>
       {children}
     </AuthContext.Provider>
   );
