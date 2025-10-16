@@ -35,7 +35,7 @@ export function PerformanceChart() {
   return (
     <Card className="h-96 shadow-xl shadow-blue-200/60">
       <CardHeader>
-        <CardTitle className="text-lg font-semibold">Performance - {selectedCourse || "Overall"}</CardTitle>
+        <CardTitle className="text-base font-semibold">Performance - {selectedCourse || "Overall"}</CardTitle>
       </CardHeader>
       <CardContent className="flex-1 flex items-end justify-center pb-4">
         {isLoading ? (

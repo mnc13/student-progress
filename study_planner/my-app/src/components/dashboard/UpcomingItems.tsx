@@ -41,7 +41,7 @@ export function UpcomingItems() {
             >
               <ChevronLeft className="w-5 h-5" />
             </button>
-            <CardTitle className="text-lg font-semibold">Syllabus</CardTitle>
+            <CardTitle className="text-base font-semibold">Syllabus</CardTitle>
           </div>
         </CardHeader>
         <CardContent className="overflow-y-auto max-h-[400px] space-y-3">
@@ -72,7 +72,7 @@ export function UpcomingItems() {
   return (
     <Card className="flex flex-col shadow-xl shadow-blue-200/60">
       <CardHeader className="flex-shrink-0">
-        <CardTitle className="text-lg font-semibold">Upcoming Items</CardTitle>
+        <CardTitle className="text-base font-semibold">Upcoming Items</CardTitle>
       </CardHeader>
       <CardContent className="overflow-y-auto max-h-[400px] space-y-3">
         {isLoading ? (
