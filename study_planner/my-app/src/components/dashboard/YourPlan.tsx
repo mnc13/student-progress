@@ -90,7 +90,7 @@ export function YourPlan() {
   return (
     <Card className="flex flex-col shadow-xl shadow-blue-200/60">
       <CardHeader className="flex-shrink-0">
-        <CardTitle className="text-lg font-semibold">Your Plan</CardTitle>
+        <CardTitle className="text-base font-semibold">Your Plan</CardTitle>
       </CardHeader>
       <CardContent ref={scrollRef} className="overflow-y-auto max-h-[400px] space-y-4">
         {(isLoading || isFetching) ? (

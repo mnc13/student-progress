@@ -75,7 +75,7 @@ export function CompletionProgress() {
   return (
     <Card className="flex flex-col h-96 shadow-xl shadow-blue-200/60">
       <CardHeader className="flex-shrink-0">
-        <CardTitle className="text-lg font-semibold">Completion Progress</CardTitle>
+        <CardTitle className="text-base font-semibold">Completion Progress</CardTitle>
       </CardHeader>
       <CardContent className="flex-1 overflow-y-auto space-y-4">
         {isLoading ? (
