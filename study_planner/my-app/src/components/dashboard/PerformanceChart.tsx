@@ -4,6 +4,19 @@ import { useAuth } from "@/contexts/AuthContext";
 import { api } from "@/lib/api";
 import { useQuery } from "@tanstack/react-query";
 
+const CustomTooltip = ({ active, payload, label }: any) => {
+  if (active && payload && payload.length) {
+    const data = payload[0].payload;
+    return (
+      <div className="bg-background border border-border rounded-lg p-3 shadow-lg">
+        <p className="font-medium">{`Item ${data.x}: ${data.topic}`}</p>
+        <p className="text-primary">{`obtained: ${(data.value * 100).toFixed(1)}%`}</p>
+      </div>
+    );
+  }
+  return null;
+};
+
 export function PerformanceChart() {
   const { studentId, selectedCourse } = useAuth();
 
@@ -16,6 +29,7 @@ export function PerformanceChart() {
   const chartData = pastItems ? pastItems.map((item: any) => ({
     x: item.idx,
     value: item.percent / 100,
+    topic: item.topic,
   })) : [];
 
   return (
@@ -52,7 +66,7 @@ export function PerformanceChart() {
                   tick={{ fill: 'hsl(var(--muted-foreground))' }}
                   tickFormatter={(value) => `${(value * 100).toFixed(0)}%`}
                 />
-                <Tooltip />
+                <Tooltip content={<CustomTooltip />} />
                 <Area
                   type="monotone"
                   dataKey="value"

@@ -49,9 +49,13 @@ def past_items(student_id: int, course: str, db: Session = Depends(get_db)):
     } for it in items]
 
 @router.get("/{student_id}/upcoming", response_model=List[UpcomingEventOut])
-def upcoming(student_id: int, course: str | None = Query(None), db: Session = Depends(get_db)):
+def upcoming(student_id: int, course: str | None = Query(None), include_past: bool = Query(False), db: Session = Depends(get_db)):
     _ensure_student(db, student_id)
     stmt = select(UpcomingEvent).where(UpcomingEvent.student_id == student_id)
+    if not include_past:
+        from datetime import date
+        today = date.today()
+        stmt = stmt.where(UpcomingEvent.date >= today)
     if course:
         stmt = stmt.where(UpcomingEvent.course == course)
     events = db.scalars(stmt.order_by(UpcomingEvent.date)).all()
