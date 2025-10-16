@@ -65,6 +65,8 @@ def upcoming(student_id: int, course: str | None = Query(None), include_past: bo
 
 @router.post("/{student_id}/study-plan/generate", response_model=GeneratePlanResponse)
 def generate_plan(student_id: int, course: str = Query(...), db: Session = Depends(get_db)):
+    from datetime import date  # local import so we can coerce ISO strings if needed
+
     _ensure_student(db, student_id)
 
     # Clear existing tasks for this course & student to avoid duplicates
@@ -73,11 +75,16 @@ def generate_plan(student_id: int, course: str = Query(...), db: Session = Depen
     )
     db.commit()
 
+    # plan.py now returns List[Dict[str, Any]]
     created = generate_study_tasks(db, student_id, course=course)
-    return {"created_tasks": [{
-        "id": t.id, "event_idx": t.event_idx, "course": t.course, "title": t.title, "topic": t.topic,
-        "due_date": t.due_date, "hours": t.hours, "status": t.status, "completion_percent": t.completion_percent
-    } for t in created]}
+
+    # If your Pydantic StudyTaskOut expects `date`, convert ISO strings back to date objects
+    for t in created:
+        if isinstance(t.get("due_date"), str):
+            t["due_date"] = date.fromisoformat(t["due_date"])
+
+    return {"created_tasks": created}
+
 
 @router.get("/{student_id}/tasks", response_model=List[StudyTaskOut])
 def list_tasks(student_id: int, course: str | None = Query(None), db: Session = Depends(get_db)):
