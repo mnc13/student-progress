@@ -1,636 +1,445 @@
-# app/services/plan.py
-from datetime import timedelta, date, datetime
-from functools import lru_cache
+from __future__ import annotations
+
+"""
+app/services/plan.py
+
+Unified planning module:
+- Groq / LLM initialization tolerant to deprecation or missing key
+- JSON prompt + retry + fallback logic
+- Topic-plan prompt with basics / focus / study_path
+- Fallback task generator
+- Task persistence & enrichment logic
+"""
+
+from datetime import timedelta, date
 from typing import List, Dict, Any, Optional
-import os
-import json
-import math
-import random
-from collections import Counter
-import re
+import logging
+from urllib.parse import quote_plus
 
 from sqlalchemy.orm import Session
-from sqlalchemy import select, and_
+from sqlalchemy import select, delete
 
 from app.models.entities import PastItem, UpcomingEvent, StudyTask
 from app.core.config import settings
 
+log = logging.getLogger(__name__)
 
-# -------- LLM / Groq client --------
+# --- Patch internal Groq httpx wrappers to drop unsupported "proxies" kwarg ---
+try:
+    from groq._base_client import SyncHttpxClientWrapper
+    _orig_init = SyncHttpxClientWrapper.__init__
 
-@lru_cache
-def get_groq_client():
-    """
-    Return a cached Groq client. Raises a clear error if the key isn't set.
-    Import happens inside to avoid hard dependency at import time.
-    """
-    from groq import Groq  # local import to keep module import cheap
-    key = getattr(settings, "GROQ_API_KEY", None) or os.getenv("GROQ_API_KEY")
-    if not key:
-        raise RuntimeError("Missing GROQ_API_KEY. Set it in your environment or settings.")
-    return Groq(api_key=key)
+    def _patched_init(self, *args, **kwargs):
+        kwargs.pop("proxies", None)
+        return _orig_init(self, *args, **kwargs)
 
+    SyncHttpxClientWrapper.__init__ = _patched_init
+except Exception:
+    pass
 
-DEFAULT_MODEL: str = getattr(settings, "GROQ_MODEL", "llama-3.3-70b-versatile")
+# --- Groq client init ---
+_client = None
+def _init_groq_client():
+    global _client
+    if not settings.HAS_GROQ:
+        _client = None
+        return
+    try:
+        from groq import Groq
+        _client = Groq(api_key=settings.GROQ_API_KEY)
+        log.info("[LLM] Groq client initialized.")
+    except Exception as e:
+        log.error("[LLM] initialization error: %s", e, exc_info=True)
+        _client = None
 
-SYSTEM_PROMPT = (
-    "You are a medical education coach. Create concise, actionable study tasks for MBBS students. "
-    "Use evidence-based strategies (spaced repetition, active recall, case-based learning, interleaving). "
-    "Keep each task specific and time-bounded. Output JSON ONLY following the schema.\n"
-    "STRICT RULES:\n"
-    "- REQUIRED FIELDS per task: title (<=120 chars), due_date (YYYY-MM-DD), hours (1–3).\n"
-    "- OPTIONAL DETAIL FIELDS (encouraged): modality (e.g., 'Anki', 'OSCE drill', 'MCQ timed'), "
-    "  focus (key subtopics), resource_hints (short list), deliverable (what to produce), "
-    "  practice_count (e.g., number of items/MCQs), notes (1–2 concise lines).\n"
-    "- Generate ORIGINAL task titles; avoid boilerplate archetypes repeated across topics.\n"
-    "- Vary modalities and subfocus (e.g., nerves/vessels/spaces; radiographs; OSPE/OSCE checklists; diagram redraws).\n"
-    "- Organize tasks like a routine: progressive difficulty, alternate modalities (read -> recall -> cases -> MCQs -> refine).\n"
-    "- Prefer evenly spaced dates between today and the event date; avoid multiple tasks on the same day unless the event is < 3 days away.\n"
-    "- Use MBBS-appropriate verbs and artifacts (Anki/flashcards, OSCE-style cases, MCQs, images/radiographs, diagrams).\n"
-    "- Never include commentary, markdown, or code — JSON only.\n"
-    "RESPONSE SCHEMA:\n"
-    "{ \"tasks\": [ { "
-    "\"title\": \"str\", "
-    "\"due_date\": \"YYYY-MM-DD\", "
-    "\"hours\": 1, "
-    "\"modality\": \"str (optional)\", "
-    "\"focus\": [\"str\", \"str\"] (optional), "
-    "\"resource_hints\": [\"str\", \"str\"] (optional), "
-    "\"deliverable\": \"str (optional)\", "
-    "\"practice_count\": 30 (optional), "
-    "\"notes\": \"str (optional)\" } ] }"
+_init_groq_client()
+
+DEFAULT_MODEL = getattr(settings, "GROQ_MODEL", "llama-3.3-70b-versatile")
+
+# --- Prompts ---
+SYSTEM_TASK_PROMPT = (
+    "You are a medical education coach for MBBS students. "
+    "Create concise, actionable tasks using evidence-based strategies (active recall, cases, MCQs). "
+    "Output strict JSON."
+)
+SYSTEM_ENRICH_PROMPT = (
+    "You are an MBBS content curator. For each topic, list 4-8 high-yield subtopics and 3-6 trusted resources (title, url, kind). "
+    "Return strict JSON."
+)
+SYSTEM_SUBTOPIC_MAP = (
+    "You are an MBBS academic coach. Extract exam-relevant subtopics and build a stepwise study map (modality, action, deliverable, time). "
+    "Return STRICT JSON, no commentary."
 )
 
-# ---- LLM call wrapper ----
-def _llm_plan(messages: List[Dict[str, Any]], model_override: Optional[str]) -> List[Dict[str, Any]]:
-    """
-    Call Groq chat.completions and return a list of tasks (dicts).
-    On any failure or bad JSON, return [] so the caller can fallback.
-    """
+def _chat_json(messages: List[Dict[str, Any]], *, max_tokens: int = 2000) -> Optional[Dict[str, Any]]:
+    if _client is None:
+        return None
     try:
-        client = get_groq_client()
-        chosen_model = model_override or DEFAULT_MODEL
-        print("Using Groq model:", chosen_model)
-    except Exception as e:
-        print("Groq client error:", e)
-        return []
-
-    try:
-        resp = client.chat.completions.create(
-            model=chosen_model,
-            temperature=0.6,          # more variety while keeping structure
-            max_tokens=1600,          # allow richer details
-            messages=messages,
+        resp = _client.chat.completions.create(
+            model=DEFAULT_MODEL,
+            temperature=0.2,
+            max_tokens=max_tokens,
             response_format={"type": "json_object"},
+            messages=messages,
         )
         content = resp.choices[0].message.content
     except Exception as e:
-        print("Groq completion error:", e)
-        return []
+        log.error("[LLM] chat failed: %s", e, exc_info=True)
+        return None
 
+    import json
     try:
-        parsed = json.loads(content or "{}")
-        if isinstance(parsed, dict) and isinstance(parsed.get("tasks"), list):
-            return parsed["tasks"]
-        if isinstance(parsed, list):
-            return parsed
+        return json.loads(content)
     except Exception as e:
-        print("JSON parse error:", e)
-    return []
-
-
-def _evenly_spread_dates(n: int, start: date, end: date) -> List[date]:
-    """Return n dates from start..end inclusive, roughly evenly spaced and strictly non-decreasing."""
-    if start > end:
-        start, end = end, start
-    if n <= 1:
-        return [end]
-    total_days = (end - start).days
-    if total_days <= 0:
-        return [end for _ in range(n)]
-    # spread including both ends
-    return [start + timedelta(days=round(i * total_days / (n - 1))) for i in range(n)]
-
-
-def _sanitize_title(t: str, topic: str) -> str:
-    t = (t or "").strip()
-    if not t:
-        return f"Study block: {topic}"
-    if len(t) > 120:
-        t = t[:118] + "…"
-    return t
-
-
-def _is_mbbs_relevant(title: str) -> bool:
-    # very soft heuristic; we only flag obviously generic items
-    generic = ["study", "read", "note", "research", "google", "random"]
-    return not all(g in title.lower() for g in generic)
-
-
-def _shorten_with_ellipsis_at_word_boundary(s: str, limit: int) -> str:
-    s = (s or "").strip()
-    if len(s) <= limit:
-        return s
-    # keep to nearest previous word boundary to avoid ugly partials
-    cut = s[:limit]
-    cut = re.sub(r"\W*\w*$", "", cut)  # drop partial trailing word
-    if not cut:
-        cut = s[:limit]
-    return cut + "…"
-
-
-# ---------- Tag normalization (robust & compact) ----------
-
-_TAG_MAX = 14  # hard cap per tag; if longer, drop the tag entirely (no ellipsis)
-_ALLOWED_TAGS = {
-    # modality canonicalization
-    "anki": "Anki",
-    "flash": "Anki",
-    "flashcards": "Anki",
-    "mcq": "MCQ",
-    "quiz": "MCQ",
-    "case": "Cases",
-    "cases": "Cases",
-    "vignette": "Cases",
-    "diagram": "Diagram",
-    "redraw": "Diagram",
-    "osce": "OSCE",
-    "ospe": "OSCE",
-    "reading": "Reading",
-    "read": "Reading",
-}
-
-_FOCUS_MAP = {
-    # map verbose focus to compact codes
-    "high-yield": "HY",
-    "high yield": "HY",
-    "integrations": "Integrations",
-    "stations": "Stations",
-    "steps": "Steps",
-    "radiographs": "Radiographs",
-    "images": "Images",
-    "landmarks": "Landmarks",
-    "relations": "Relations",
-}
-
-_DELIVERABLE_MAP = {
-    "concept map": "Concept map",
-    "outline": "Outline",
-    "checklist": "Checklist",
-    "error log": "Error log",
-    "notes": "Notes",
-    "labeled diagram": "Labeled diagram",
-}
-
-
-def _canon_from_text(text: str) -> Optional[str]:
-    t = (text or "").strip().lower()
-    if not t:
+        log.error("[LLM] JSON parse failed: %s — content: %s", e, content, exc_info=True)
         return None
-    for key, val in _ALLOWED_TAGS.items():
-        if key in t:
-            return val
-    return None
 
+# --- PubMed & URL helpers ---
+def _pubmed_search_url(query: str, *, filters: Optional[Dict[str, str]] = None) -> str:
+    base = "https://pubmed.ncbi.nlm.nih.gov/?term="
+    url = base + quote_plus(query)
+    if filters:
+        for k, v in filters.items():
+            url += f"&{quote_plus(k)}={quote_plus(v)}"
+    return url
 
-def _compress_focus_tokens(focus: Any, topic: str) -> List[str]:
-    """
-    Return up to 2 short focus tags.
-    - drop tokens that repeat or include the topic
-    - ignore tokens with ':' (like 'focus: Clinical Anatomy')
-    - map verbose -> compact when possible
-    """
-    if not isinstance(focus, list):
-        return []
-    out = []
-    topic_l = (topic or "").lower()
-    for raw in focus:
-        tok = str(raw or "").strip()
-        if not tok or ":" in tok:
+def _pubmed_esearch_url(query: str, *, retmax: int = 100) -> str:
+    base = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
+    params = f"?db=pubmed&retmode=json&retmax={retmax}&term={quote_plus(query)}"
+    return base + params
+
+def _mesh_browse_url(term: str) -> str:
+    return "https://meshb.nlm.nih.gov/search?query=" + quote_plus(term)
+
+def _bookshelf_search_url(q: str) -> str:
+    return "https://www.ncbi.nlm.nih.gov/books/?term=" + quote_plus(q)
+
+def _radiopaedia_search_url(q: str) -> str:
+    return "https://radiopaedia.org/search?lang=us&q=" + quote_plus(q)
+
+def _build_pubmed_queries(topic: str, subtopics: List[str]) -> Dict[str, Any]:
+    topic_q = topic.strip()
+    base_q = f"({topic_q})"
+    recent = {"filter": "years.5"}
+    bundle: Dict[str, Any] = {
+        "topic": topic_q,
+        "overview": {
+            "pubmed_ui": _pubmed_search_url(base_q, filters=recent),
+            "pubmed_esearch": _pubmed_esearch_url(base_q),
+            "mesh": _mesh_browse_url(topic_q),
+            "bookshelf": _bookshelf_search_url(topic_q),
+        },
+        "angles": {
+            "reviews": _pubmed_search_url(f"{base_q} AND (review[Publication Type])", filters=recent),
+            "guidelines": _pubmed_search_url(f"{base_q} AND (guideline[Publication Type])", filters=recent),
+            "imaging": _pubmed_search_url(f"{base_q} AND (diagnostic imaging[MeSH Terms])", filters=recent),
+        },
+        "by_subtopic": [],
+        "adjacent": {"radiopaedia": _radiopaedia_search_url(topic_q)}
+    }
+    for st in (subtopics or [])[:10]:
+        stq = st.strip()
+        if not stq:
             continue
-        tl = tok.lower()
-        if topic_l and (topic_l in tl):
-            continue
-        # compact mapping
-        for k, v in _FOCUS_MAP.items():
-            if k in tl:
-                tok = v
-                break
-        # drop overly long focus tokens
-        if len(tok) > _TAG_MAX:
-            continue
-        # dedupe case-insensitive
-        if all(tok.lower() != o.lower() for o in out):
-            out.append(tok)
-        if len(out) >= 2:
-            break
-    return out
+        q = f'("{topic_q}") AND ("{stq}"[Title/Abstract] OR "{stq}"[MeSH Terms])'
+        bundle["by_subtopic"].append({
+            "subtopic": stq,
+            "pubmed_ui": _pubmed_search_url(q, filters=recent),
+            "pubmed_esearch": _pubmed_esearch_url(q),
+            "mesh": _mesh_browse_url(stq),
+        })
+    return bundle
 
-
-def _deliverable_tag(text: Any) -> Optional[str]:
-    t = str(text or "").strip().lower()
-    if not t:
-        return None
-    for k, v in _DELIVERABLE_MAP.items():
-        if k in t:
-            return v
-    # last resort: keep a very short token if it is short enough
-    if len(t) <= 10:
-        return t.capitalize()
-    return None
-
-
-def _extract_detail_tags(task: Dict[str, Any], topic: str) -> List[str]:
-    """
-    Convert rich optional fields into compact, standardized tags.
-    Rules:
-      - Use canonical tags for modality.
-      - Practice count attaches to MCQ as 'MCQ xN'; otherwise 'N items'.
-      - Focus: up to 2 short tokens, skipping topic and 'focus:' noise.
-      - Deliverable: mapped to an approved short tag.
-      - No ellipses inside tags; if too long, drop.
-      - Max 3 tags total.
-    """
-    tags: List[str] = []
-
-    # 1) Modality
-    modality = str(task.get("modality", "") or "").strip()
-    mtag = _canon_from_text(modality)
-    if mtag:
-        tags.append(mtag)
-
-    # 2) Practice count
-    pc = task.get("practice_count")
-    pc_int = None
-    try:
-        if pc is not None:
-            pc_int = int(pc)
-    except Exception:
-        pc_int = None
-    if pc_int and pc_int > 0:
-        if "MCQ" in tags:
-            tags.append(f"x{pc_int}")  # pairs with MCQ
-        else:
-            # keep short; if too long, drop later
-            tags.append(f"{pc_int} items")
-
-    # 3) Focus
-    tags.extend(_compress_focus_tokens(task.get("focus"), topic))
-
-    # 4) Deliverable
-    dtag = _deliverable_tag(task.get("deliverable"))
-    if dtag:
-        tags.append(dtag)
-
-    # 5) Filter by length and allowed chars; dedupe
-    cleaned: List[str] = []
-    seen = set()
-    for t in tags:
-        t = (t or "").strip()
-        if not t:
-            continue
-        if len(t) > _TAG_MAX:
-            continue
-        key = t.lower()
-        if key not in seen:
-            seen.add(key)
-            cleaned.append(t)
-
-    # 6) Keep order, cap at 3 tags
-    return cleaned[:3]
-
-
-def _enrich_title_with_details(base_title: str, task: Dict[str, Any], topic: str) -> str:
-    """
-    Add up to 3 compact standardized tags, keeping <=120 chars.
-    We only add tags if there's enough room for at least '  [XXXX]'.
-    """
-    base = _sanitize_title(base_title, topic)
-    tags = _extract_detail_tags(task, topic)
-    if not tags:
-        return base
-
-    # Build suffix incrementally; stop when exceeding 120
-    suffix = ""
-    for tag in tags:
-        candidate = f"{suffix} [{tag}]"
-        if len(base) + len(candidate) <= 120:
-            suffix = candidate
-        else:
-            break
-    return base + suffix
-
-
-# ---------- Fallback plan (varied, spaced, with detail fields) ----------
-
-def _fallback_plan(upc: UpcomingEvent, weak_topics: List[str], today: date) -> List[Dict[str, Any]]:
-    """
-    Rule-based backup when LLM is unavailable or returns invalid JSON.
-    Evenly spread tasks from 'today'..'upc.date' (inclusive), vary titles, and weave weak topics.
-    Includes optional details that postprocessor can compress into titles.
-    """
-    end = upc.date
-    if end < today:
-        end = today
-
-    # decide task count by horizon (aim 4–6)
-    horizon = (end - today).days
-    n = 6 if horizon >= 10 else 5 if horizon >= 5 else max(4, min(5, horizon + 1))
-
-    topic = upc.topic
-    weak_hint = ", ".join([w for w in weak_topics[:2]]) if weak_topics else None
-
-    plan = [
-        {
-            "title": f"Concept map + core reading: {topic}",
-            "modality": "Reading + concept map",
-            "focus": [topic],
-            "resource_hints": ["BRS/standard text", "class notes"],
-            "deliverable": "concept map",
-        },
-        {
-            "title": f"Active recall drill: {topic}",
-            "modality": "Anki",
-            "focus": ([weak_hint] if weak_hint else []) + ["high-yield"],
-            "resource_hints": ["Anki deck", "self-made cloze"],
-            "practice_count": 80,
-            "deliverable": "notes",
-        },
-        {
-            "title": f"Diagram redraw + labeling: {topic}",
-            "modality": "diagram",
-            "focus": ["relations", "landmarks"],
-            "resource_hints": ["atlas images"],
-            "deliverable": "labeled diagram",
-        },
-        {
-            "title": f"Clinical vignettes + images: {topic}",
-            "modality": "cases",
-            "focus": ["radiographs", "images"],
-            "resource_hints": ["case bank", "radiology set"],
-            "practice_count": 15,
-            "deliverable": "notes",
-        },
-        {
-            "title": f"MCQ set (timed) + error log: {topic}",
-            "modality": "MCQ timed",
-            "focus": (([weak_hint] if weak_hint else []) + ["integrations"]),
-            "resource_hints": ["MCQ bank"],
-            "practice_count": 40,
-            "deliverable": "error log",
-        },
-        {
-            "title": f"OSCE/OSPE checklist & quick recap: {topic}",
-            "modality": "OSCE",
-            "focus": ["stations", "steps"],
-            "resource_hints": ["OSCE checklist"],
-            "deliverable": "checklist",
-        },
+# --- Fallback plan for tasks ---
+def _fallback_plan(upc: UpcomingEvent, weak_topics: List[str]) -> List[Dict[str, Any]]:
+    log.info("[LLM] using fallback plan for %s", upc.topic)
+    due = upc.date
+    blocks = [
+        {"title": f"Read core concepts of {upc.topic}", "days_before": 7, "hours": max(1, upc.hours//5)},
+        {"title": f"Active recall: {upc.topic}", "days_before": 5, "hours": max(1, upc.hours//6)},
+        {"title": f"Case studies & images: {upc.topic}", "days_before": 3, "hours": max(1, upc.hours//6)},
+        {"title": f"MCQ practice & review: {upc.topic}", "days_before": 2, "hours": max(1, upc.hours//6)},
+        {"title": f"Final summary & test: {upc.topic}", "days_before": 0, "hours": 1},
     ]
+    if weak_topics:
+        blocks.insert(1, {
+            "title": f"Remediate weak: {', '.join(weak_topics[:2])}",
+            "days_before": 6,
+            "hours": 2
+        })
+    tasks: List[Dict[str, Any]] = []
+    for b in blocks:
+        d = (due - timedelta(days=b["days_before"])).isoformat()
+        tasks.append({"title": b["title"], "due_date": d, "hours": b["hours"], "topic": upc.topic})
+    return tasks
 
-    dates = _evenly_spread_dates(n, today, end)
-
-    # hour heuristics (1–3)
-    base = max(1, min(3, upc.hours // max(1, n)))
-    hours = [max(1, min(3, base)) for _ in range(n)]
-    for i, p in enumerate(plan[:n]):
-        mm = str(p.get("modality", "")).lower()
-        if any(k in mm for k in ["mcq", "case", "osce"]):
-            hours[i] = min(3, hours[i] + 1)
-
-    out = []
-    for i in range(n):
-        item = {
-            "title": plan[i]["title"],
-            "due_date": dates[i].isoformat(),
-            "hours": int(hours[i]),
-        }
-        item.update({k: v for k, v in plan[i].items() if k not in ["title"]})
-        out.append(item)
-    return out
-
-
-# ---------- Post-processing ----------
-
-def _postprocess_tasks(
-    raw_tasks: List[Dict[str, Any]],
-    upc: UpcomingEvent,
-    today: date,
+# --- New: LLM topic plan with “basics / focus / study_path” prompt ---
+def _llm_topic_plan_with_path(
+    upc: UpcomingEvent, weak_topics: List[str]
 ) -> List[Dict[str, Any]]:
-    """
-    Enforce:
-    - 4–6 tasks
-    - hours 1–3 (int)
-    - due_date clamped between today and event date
-    - titles unique, short, original-ish
-    - routine spacing if clustered
-    - integrate optional detail fields into titles as compact, standardized tags (no ellipses)
-    """
-    if not raw_tasks:
-        return []
+    # Build the prompt
+    user = {
+        "role": "user",
+        "content": f"""
+You are a medical education coach.  
 
-    # 1) Coerce + basic validation
-    coerced: List[Dict[str, Any]] = []
-    for t in raw_tasks:
-        try:
-            base_title = str(t.get("title", ""))
-            title = _enrich_title_with_details(_sanitize_title(base_title, upc.topic), t, upc.topic)
-            hours = int(t.get("hours", 1))
-            hours = max(1, min(3, hours))
-            due_s = str(t.get("due_date", upc.date.isoformat()))
-            d = date.fromisoformat(due_s[:10])  # accept date or datetime
-        except Exception:
-            d = upc.date
-            title = _sanitize_title("Study block", upc.topic)
-            hours = 1
+Topic: "{upc.topic}"
+Historically weak subtopics: {', '.join(weak_topics)}  
 
-        # clamp date
-        if d < today:
-            d = today
-        if d > upc.date:
-            d = upc.date
+Produce EXACT JSON with this schema (no extra keys):
+{{
+  "topic": "str",
+  "basics": ["str", ...],
+  "focus": ["str", ...],
+  "study_path": [
+    {{
+      "step": 1,
+      "modality": "Active Recall",
+      "target": "str",
+      "deliverable": "str"
+    }},
+    {{
+      "step": 2,
+      "modality": "Case-based Learning",
+      "target": "str",
+      "deliverable": "str"
+    }},
+    {{
+      "step": 3,
+      "modality": "MCQ Practice",
+      "target": "str",
+      "deliverable": "str"
+    }},
+    {{
+      "step": 4,
+      "modality": "Review",
+      "target": "str",
+      "deliverable": "str"
+    }}
+  ]
+}}
+"""
+    }
+    messages = [{"role": "system", "content": SYSTEM_TASK_PROMPT}, user]
 
-        coerced.append({"title": title, "due_date": d, "hours": hours})
+    data = _chat_json(messages)
+    if not (isinstance(data, dict) and "study_path" in data and "basics" in data):
+        log.warning("[LLM] detailed plan with path failed for %s, fallback to simpler plan", upc.topic)
+        return []  # fallback upstream will handle
 
-    # 2) Enforce count 4–6
-    if len(coerced) < 4:
-        pads_needed = 4 - len(coerced)
-        scaffold = [
-            "Active recall (flashcards)",
-            "Image review & labeling",
-            "MCQ set + error log",
-            "Case vignette walkthrough",
-        ]
-        for i in range(pads_needed):
-            coerced.append(
-                {
-                    "title": f"{scaffold[i % len(scaffold)]}: {upc.topic}",
-                    "due_date": upc.date,
-                    "hours": 1,
-                }
-            )
-    elif len(coerced) > 6:
-        coerced = coerced[:6]
+    # Translate study_path into tasks
+    tasks: List[Dict[str, Any]] = []
+    for step in data["study_path"]:
+        mod = step.get("modality")
+        tgt = step.get("target")
+        title = f"{mod}: {tgt}" if tgt else mod
+        tasks.append({
+            "title": title,
+            "topic": upc.topic,
+            "modality": mod,
+            "focus": [tgt] if tgt else []
+        })
+    return tasks
 
-    # 3) De-duplicate titles (light normalization)
-    seen = set()
-    uniq: List[Dict[str, Any]] = []
-    for t in coerced:
-        key = t["title"].strip().lower()
-        if key in seen or key == upc.topic.strip().lower():
-            suffix = random.choice([" (recall)", " (MCQs)", " (cases)", " (diagram)"])
-            new_title = (t["title"] + suffix)[:120]
-            key = new_title.strip().lower()
-            t["title"] = new_title
-        if key not in seen:
-            seen.add(key)
-            uniq.append(t)
-    coerced = uniq
+# --- Existing LLM topic plan (fallback) ---
+def _llm_topic_plan(upc: UpcomingEvent, weak_topics: List[str]) -> List[Dict[str, Any]]:
+    messages = [
+        {"role": "system", "content": SYSTEM_TASK_PROMPT},
+        {
+            "role": "user",
+            "content": f"""
+Create a short study plan for topic "{upc.topic}". Available hours: {upc.hours}. Weak topics: {', '.join(weak_topics)}.
 
-    # 4) Force routine spacing if dates are too clustered
-    dates = [t["due_date"] for t in coerced]
-    counts = Counter(dates)
-    # re-spread if ANY duplicate day exists OR if we have fewer than (len(coerced) - 1) unique days
-    if any(c > 1 for c in counts.values()) or len(counts) < len(coerced) - 1:
-        spread = _evenly_spread_dates(len(coerced), today, upc.date)
-        # stable mapping so titles/dates look intentional
-        for i, t in enumerate(sorted(coerced, key=lambda x: (x["due_date"], x["title"]))):
-            t["due_date"] = spread[i]
-
-    # 5) Soft MBBS relevance nudges
-    for t in coerced:
-        if not _is_mbbs_relevant(t["title"]):
-            t["title"] = f"Clinically-applied study: {upc.topic} (MCQs + cases)"
-
-    # 6) Final coerce to serializable dicts
-    finalized = [
-        {"title": t["title"], "due_date": t["due_date"].isoformat(), "hours": int(t["hours"])}
-        for t in coerced
+Output strict JSON:
+{{ "tasks": [ {{ "title":"str", "topic":"str", "due_date":"YYYY-MM-DD", "hours": int, "subtopics":["str"], "resources":[{{"title","url","kind"}}] }} ] }}
+"""
+        },
     ]
-    return finalized
+    data = _chat_json(messages)
+    if not data or "tasks" not in data or not isinstance(data["tasks"], list):
+        return []
+    tasks: List[Dict[str, Any]] = []
+    for t in data["tasks"]:
+        try:
+            due = t["due_date"]
+            hrs = int(t.get("hours", 1))
+            title = t["title"]
+            sub = list(t.get("subtopics", []))
+            res = list(t.get("resources", []))
+            tasks.append({
+                "title": title,
+                "topic": upc.topic,
+                "due_date": due,
+                "hours": hrs,
+                "subtopics": sub,
+                "resources": res,
+            })
+        except Exception:
+            continue
+    return tasks
 
-
+# --- Persist tasks to DB + orchestration ---
 def generate_study_tasks(
     db: Session,
     student_id: int,
     course: str,
-    model: Optional[str] = None,
-) -> List[Dict[str, Any]]:
-    """
-    Generate tasks ONLY for the selected course. Idempotent per event.
-    Returns a list of plain dicts (serialized before commit) to avoid
-    SQLAlchemy ObjectDeletedError / expired attributes issues.
-    """
-    today = date.today()
-
-    # Upcoming events for this course
-    upcomings = db.scalars(
+    *,
+    final_only: bool = False,
+    use_llm: bool = True
+) -> List[StudyTask]:
+    upcs = db.scalars(
         select(UpcomingEvent).where(
             UpcomingEvent.student_id == student_id,
             UpcomingEvent.course == course,
         )
     ).all()
 
-    # Weak topics for this course
     past = db.scalars(
-        select(PastItem).where(
-            PastItem.student_id == student_id,
-            PastItem.course == course,
-        )
+        select(PastItem).where(PastItem.student_id == student_id, PastItem.course == course)
     ).all()
-    weak_topics = [p.topic for p in past if getattr(p, "mark", 0) < 0.5]
+    weak = [p.topic for p in past if (p.mark or 0.0) < 0.5]
 
-    created_tasks: List[StudyTask] = []
+    created: List[StudyTask] = []
+    if use_llm and _client is None:
+        raise RuntimeError("LLM requested but not configured")
 
-    for upc in upcomings:
-        # ---- Idempotency: skip if tasks already exist for this event ----
-        existing = db.scalars(
-            select(StudyTask).where(
-                and_(
-                    StudyTask.student_id == student_id,
-                    StudyTask.course == upc.course,
-                    StudyTask.event_idx == upc.idx,
-                )
-            )
-        ).first()
-        if existing:
-            # already generated for this event; skip creating duplicates
-            continue
+    for upc in upcs:
+        db.execute(delete(StudyTask).where(
+            StudyTask.student_id == student_id,
+            StudyTask.course == course,
+            StudyTask.event_idx == upc.idx
+        ))
 
-        user_prompt = {
-            "role": "user",
-            "content": f"""
-Student is preparing for upcoming topic "{upc.topic}" in the course "{upc.course}" on {upc.date}.
-They have approximately {upc.hours} study hours in total before the event.
-Historically weak topics for this course: {", ".join(weak_topics) if weak_topics else "None"}.
+        # Try new detailed variant first
+        tasks_json = []
+        if use_llm:
+            tasks_json = _llm_topic_plan_with_path(upc, weak)
+            if not tasks_json:
+                log.info("[LLM] fallback to simpler topic plan for %s", upc.topic)
+                tasks_json = _llm_topic_plan(upc, weak)
+            if not tasks_json:
+                log.warning("[LLM] no tasks via LLM for %s; fallback plan", upc.topic)
 
-Create 4–6 granular tasks with:
-- REQUIRED: "title" (<=120 chars, ORIGINAL), "due_date" (YYYY-MM-DD, strictly between today ({today}) and the event date ({upc.date})), "hours" (integer 1–3).
-- OPTIONAL (encouraged): "modality", "focus" (list), "resource_hints" (list), "deliverable", "practice_count", "notes".
-- Avoid placing multiple tasks on the same calendar day unless {upc.date} is within 3 days of {today}.
-- Spread like a routine (progression + interleaving), and tie at least one task directly to historically weak topics if any.
+        if not tasks_json:
+            tasks_json = _fallback_plan(upc, weak)
 
-Prioritize MBBS relevance (anatomy, physiology, pathology, pharmacology, micro, community medicine, OSCE/OSPE where relevant).
-Encourage active recall (flashcards/Anki), spaced repetition, case images/radiographs, and MCQs with error logging.
-
-Respond with JSON ONLY in this exact schema:
-{{ "tasks": [ {{ "title": "str", "due_date": "YYYY-MM-DD", "hours": 1, "modality": "str (optional)", "focus": ["str"], "resource_hints": ["str"], "deliverable": "str", "practice_count": 30, "notes": "str" }} ] }}
-""".strip(),
-        }
-
-        raw_tasks = _llm_plan([{"role": "system", "content": SYSTEM_PROMPT}, user_prompt], model)
-        print("LLM returned tasks:", raw_tasks)
-        if not raw_tasks:
-            raw_tasks = _fallback_plan(upc, weak_topics, today)
-
-        tasks_json = _postprocess_tasks(raw_tasks, upc, today)
-
+        # Postprocess & persist
         for t in tasks_json:
-            # Validate again and coerce (defensive)
             try:
-                due = date.fromisoformat(str(t["due_date"])[:10])
-                # clamp once more
-                if due < today:
-                    due = today
-                if due > upc.date:
-                    due = upc.date
-                hours = int(t.get("hours", 1))
-                hours = max(1, min(3, hours))
-                title = str(t["title"])[:200]
+                due = date.fromisoformat(str(t.get("due_date", upc.date.isoformat())))
             except Exception:
-                continue
-
-            task = StudyTask(
+                due = upc.date
+            hrs = int(t.get("hours", 1) or 1)
+            title = str(t.get("title", ""))[:200]
+            topic_for_row = (t.get("topic") or upc.topic)[:120]
+            row = StudyTask(
                 student_id=student_id,
-                course=upc.course,
+                course=course,
                 event_idx=upc.idx,
                 title=title,
-                topic=upc.topic,
+                topic=topic_for_row,
                 due_date=due,
-                hours=hours,
+                hours=hrs,
                 status="not_started",
                 completion_percent=0,
             )
-            db.add(task)
-            db.flush()  # assign id, etc.
-            created_tasks.append(task)
-
-    # ---- Serialize BEFORE commit (prevents expired/refresh issues) ----
-    payload: List[Dict[str, Any]] = [
-        {
-            "id": t.id,
-            "student_id": t.student_id,
-            "course": t.course,
-            "event_idx": t.event_idx,
-            "title": t.title,
-            "topic": t.topic,
-            "due_date": t.due_date.isoformat(),
-            "hours": t.hours,
-            "status": t.status,
-            "completion_percent": t.completion_percent,
-        }
-        for t in created_tasks
-    ]
+            db.add(row)
+            created.append(row)
 
     db.commit()
-    return payload
+    return created
+
+# --- Enrichment with fallback for JSON errors ---
+def fetch_topic_enrichment(course: str, topics: List[str]) -> Dict[str, Dict[str, Any]]:
+    import json
+    if _client is None:
+        # fallback deterministic
+        out: Dict[str, Dict[str, Any]] = {}
+        for t in topics:
+            subs = [f"{t}: core concepts", f"{t}: clinical relevance", f"{t}: imaging", f"{t}: MCQ pitfalls"]
+            res = [
+                {"title": f"{t} overview", "url": f"https://pubmed.ncbi.nlm.nih.gov/?term={t.replace(' ', '%20')}", "kind": "article"},
+                {"title": f"{t} lecture", "url": f"https://www.youtube.com/results?search_query={t.replace(' ', '+')}+mbbs", "kind": "video"},
+            ]
+            out[t] = {"subtopics": subs, "resources": res}
+            out[t]["pubmed"] = _build_pubmed_queries(t, subs)
+        return out
+
+    user = {
+        "role": "user",
+        "content": (
+            "You are an expert MBBS content curator. Topics: " + ", ".join(topics) +
+            "\nReturn strict JSON mapping each topic to {subtopics: [..], resources: [..]}. "\
+            "4-8 subtopics and 3-6 resources each. No commentary."
+        )
+    }
+    messages = [{"role": "system", "content": SYSTEM_ENRICH_PROMPT}, user]
+
+    parsed = _chat_json(messages)
+    if parsed is None:
+        log.warning("[LLM] enrichment JSON failed, using fallback for %s", topics)
+        return fetch_topic_enrichment(course, topics)  # recursion but will go fallback path if _client is None
+
+    out: Dict[str, Dict[str, Any]] = {}
+    for t in topics:
+        node = parsed.get(t)
+        if not isinstance(node, dict):
+            subs = [f"{t}: core concepts", f"{t}: MCQ pitfalls"]
+            res = [{"title": f"{t} fallback", "url": f"https://pubmed.ncbi.nlm.nih.gov/?term={t.replace(' ', '%20')}", "kind": "article"}]
+            out[t] = {"subtopics": subs, "resources": res}
+        else:
+            subs = [str(s) for s in node.get("subtopics", [])][:8]
+            clean_res: List[Dict[str, str]] = []
+            for r in (node.get("resources") or [])[:6]:
+                try:
+                    clean_res.append({
+                        "title": str(r.get("title", ""))[:200],
+                        "url": str(r.get("url", "")),
+                        "kind": str(r.get("kind", "site")).lower(),
+                    })
+                except Exception:
+                    continue
+            out[t] = {"subtopics": subs, "resources": clean_res}
+        out[t]["pubmed"] = _build_pubmed_queries(t, out[t]["subtopics"])
+    return out
+
+# --- Subtopic map endpoints ---
+def subtopic_map_user_prompt(topic: str, course: str) -> Dict[str, str]:
+    return {
+        "role": "user",
+        "content": f"""
+Course: {course}
+Topic: {topic}
+
+Produce STRICT JSON:
+{{
+  "topic": "str",
+  "subtopics": [ {{ "section":"str", "items":["str", ...] }} ],
+  "study_path": [ {{ "step":1, "title":"str","modality":"Reading|Anki|MCQ|Cases|OSCE", "action":"str", "deliverable":"str", "time_box_hours":1 }} ],
+  "resource_hints": ["str", ...]
+}}
+"""
+    }
+
+def fetch_subtopic_map(topic: str, course: str) -> Optional[Dict[str, Any]]:
+    data = _chat_json([{"role": "system", "content": SYSTEM_SUBTOPIC_MAP}, subtopic_map_user_prompt(topic, course)],
+                      max_tokens=1400)
+    if not isinstance(data, dict):
+        log.warning("[LLM] subtopic_map JSON invalid for %s", topic)
+        return None
+    data["topic"] = str(data.get("topic", topic))[:200]
+    data["subtopics"] = data.get("subtopics", [])
+    data["study_path"] = data.get("study_path", [])
+    data["resource_hints"] = data.get("resource_hints", [])
+    return data
+
+def fetch_subtopic_map_with_pubmed(topic: str, course: str) -> Optional[Dict[str, Any]]:
+    m = fetch_subtopic_map(topic, course)
+    if not m:
+        return None
+    sub_items: List[str] = []
+    for sec in m.get("subtopics", []):
+        sub_items.extend(sec.get("items", []))
+    sub_items = [s for s in sub_items if s][:12]
+    m["pubmed"] = _build_pubmed_queries(topic, sub_items)
+    return m

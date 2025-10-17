@@ -1,12 +1,10 @@
-from sqlalchemy import Column, Integer, String, Float, Date
-from sqlalchemy.orm import declarative_base
+# app/models/entities.py
+from sqlalchemy import Boolean, Column, Integer, String, Date, Float
 from .db import Base
-
 
 class Student(Base):
     __tablename__ = "students"
     student_id = Column(Integer, primary_key=True, index=True)
-
 
 class PastItem(Base):
     __tablename__ = "past_items"
@@ -18,7 +16,6 @@ class PastItem(Base):
     hours = Column(Integer, nullable=False)
     mark = Column(Float, nullable=False)
 
-
 class UpcomingEvent(Base):
     __tablename__ = "upcoming_events"
     id = Column(Integer, primary_key=True, index=True, autoincrement=True)
@@ -28,7 +25,7 @@ class UpcomingEvent(Base):
     topic = Column(String, nullable=False)
     hours = Column(Integer, nullable=False)
     date = Column(Date, nullable=False)
-
+    is_final = Column(Boolean, nullable=False, default=False, server_default="0")
 
 class StudyTask(Base):
     __tablename__ = "study_tasks"
