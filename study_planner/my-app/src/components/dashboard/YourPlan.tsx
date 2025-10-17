@@ -5,18 +5,27 @@ import { useAuth } from "@/contexts/AuthContext";
 import { api } from "@/lib/api";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { Button } from "@/components/ui/button";
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
+import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 
 export function YourPlan() {
   const { studentId, selectedCourse } = useAuth();
   const queryClient = useQueryClient();
   const scrollRef = useRef<HTMLDivElement>(null);
   const scrollPositionRef = useRef<number>(0);
+  const [selectedTopic, setSelectedTopic] = useState<string | null>(null);
+  const [isModalOpen, setIsModalOpen] = useState(false);
 
   const { data: tasks, isLoading, isFetching } = useQuery({
     queryKey: ["tasks", studentId, selectedCourse],
     queryFn: () => studentId ? api.getTasks(parseInt(studentId), selectedCourse || undefined) : Promise.resolve([]),
     enabled: !!studentId && !!selectedCourse,
+  });
+
+  const { data: syllabusData, isLoading: syllabusLoading } = useQuery({
+    queryKey: ["syllabus", selectedTopic, selectedCourse],
+    queryFn: () => selectedTopic ? api.getSyllabus(selectedCourse!, selectedTopic) : Promise.resolve(null),
+    enabled: !!selectedTopic && !!selectedCourse,
   });
 
   const generatePlanMutation = useMutation({
@@ -77,6 +86,16 @@ export function YourPlan() {
     updateTaskMutation.mutate({ taskId, status });
   };
 
+  const handleViewPlan = (topic: string) => {
+    setSelectedTopic(topic);
+    setIsModalOpen(true);
+  };
+
+  const handleCloseModal = () => {
+    setIsModalOpen(false);
+    setSelectedTopic(null);
+  };
+
   // Group tasks by topic
   const groupedTasks: { [key: string]: any[] } = {};
   if (tasks) {
@@ -98,7 +117,17 @@ export function YourPlan() {
         ) : Object.keys(groupedTasks).length > 0 ? (
           Object.entries(groupedTasks).map(([topic, topicTasks]) => (
             <div key={topic}>
-              <h4 className="font-semibold mb-2">{topic}</h4>
+              <div className="flex items-center justify-between mb-2">
+                <h4 className="font-semibold">{topic}</h4>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => handleViewPlan(topic)}
+                  className="text-xs"
+                >
+                  View Plan
+                </Button>
+              </div>
               {topicTasks.map((task: any) => (
                 <div key={task.id} className="flex items-start gap-3 mb-3">
                   <input
@@ -122,6 +151,223 @@ export function YourPlan() {
           <div className="text-center text-muted-foreground">No plan available.</div>
         )}
       </CardContent>
+
+      <Dialog open={isModalOpen} onOpenChange={setIsModalOpen}>
+        <DialogContent className="max-w-2xl max-h-[80vh] overflow-y-auto">
+          <DialogHeader>
+            <DialogTitle>{selectedTopic} - Detailed Plan</DialogTitle>
+          </DialogHeader>
+          {syllabusLoading ? (
+            <div className="text-center text-muted-foreground">Loading...</div>
+          ) : syllabusData ? (
+            <div className="space-y-6">
+              {/* Subtopics Section */}
+              {syllabusData.subtopics && syllabusData.subtopics.length > 0 && (
+                <div>
+                  <h4 className="font-semibold mb-2">Subtopics</h4>
+                  <ul className="list-disc list-inside space-y-1 text-sm">
+                    {syllabusData.subtopics.map((subtopic: string, index: number) => (
+                      <li key={index}>{subtopic}</li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+
+              {/* Videos Section */}
+              {syllabusData.resources && syllabusData.resources.filter((r: any) => r.kind === 'video').length > 0 && (
+                <div>
+                  <h4 className="font-semibold mb-2">Videos</h4>
+                  <ul className="space-y-1 text-sm">
+                    {syllabusData.resources.filter((r: any) => r.kind === 'video').map((resource: any, index: number) => (
+                      <li key={index}>
+                        <a
+                          href={resource.url}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="text-blue-600 hover:underline"
+                        >
+                          {resource.title}
+                        </a>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+
+              {/* Research Links Section */}
+              <div>
+                <h4 className="font-semibold mb-2">Research Links</h4>
+                <ul className="space-y-1 text-sm">
+                  {/* From resources with kind article */}
+                  {syllabusData.resources && syllabusData.resources.filter((r: any) => r.kind === 'article').map((resource: any, index: number) => (
+                    <li key={`article-${index}`}>
+                      <a
+                        href={resource.url}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="text-blue-600 hover:underline"
+                      >
+                        {resource.title}
+                      </a>
+                    </li>
+                  ))}
+                  {/* From pubmed overview */}
+                  {syllabusData.pubmed && syllabusData.pubmed.overview && (
+                    <>
+                      <li>
+                        <a
+                          href={syllabusData.pubmed.overview.pubmed_ui}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="text-blue-600 hover:underline"
+                        >
+                          PubMed Overview
+                        </a>
+                      </li>
+                      <li>
+                        <a
+                          href={syllabusData.pubmed.overview.pubmed_esearch}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="text-blue-600 hover:underline"
+                        >
+                          PubMed ESearch
+                        </a>
+                      </li>
+                      <li>
+                        <a
+                          href={syllabusData.pubmed.overview.mesh}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="text-blue-600 hover:underline"
+                        >
+                          MeSH Browse
+                        </a>
+                      </li>
+                      <li>
+                        <a
+                          href={syllabusData.pubmed.overview.bookshelf}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="text-blue-600 hover:underline"
+                        >
+                          NCBI Bookshelf
+                        </a>
+                      </li>
+                    </>
+                  )}
+                  {/* From pubmed angles */}
+                  {syllabusData.pubmed && syllabusData.pubmed.angles && (
+                    <>
+                      <li>
+                        <a
+                          href={syllabusData.pubmed.angles.reviews}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="text-blue-600 hover:underline"
+                        >
+                          PubMed Reviews
+                        </a>
+                      </li>
+                      <li>
+                        <a
+                          href={syllabusData.pubmed.angles.guidelines}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="text-blue-600 hover:underline"
+                        >
+                          PubMed Guidelines
+                        </a>
+                      </li>
+                      <li>
+                        <a
+                          href={syllabusData.pubmed.angles.imaging}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="text-blue-600 hover:underline"
+                        >
+                          PubMed Imaging
+                        </a>
+                      </li>
+                    </>
+                  )}
+                  {/* From pubmed by_subtopic */}
+                  {syllabusData.pubmed && syllabusData.pubmed.by_subtopic && syllabusData.pubmed.by_subtopic.map((sub: any, index: number) => (
+                    <div key={`sub-${index}`}>
+                      <li>
+                        <a
+                          href={sub.pubmed_ui}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="text-blue-600 hover:underline"
+                        >
+                          {sub.subtopic} - PubMed
+                        </a>
+                      </li>
+                      <li>
+                        <a
+                          href={sub.pubmed_esearch}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="text-blue-600 hover:underline"
+                        >
+                          {sub.subtopic} - PubMed ESearch
+                        </a>
+                      </li>
+                      <li>
+                        <a
+                          href={sub.mesh}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="text-blue-600 hover:underline"
+                        >
+                          {sub.subtopic} - MeSH
+                        </a>
+                      </li>
+                    </div>
+                  ))}
+                  {/* From pubmed adjacent */}
+                  {syllabusData.pubmed && syllabusData.pubmed.adjacent && (
+                    <li>
+                      <a
+                        href={syllabusData.pubmed.adjacent.radiopaedia}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="text-blue-600 hover:underline"
+                      >
+                        Radiopaedia
+                      </a>
+                    </li>
+                  )}
+                </ul>
+              </div>
+
+              {/* Documents and Papers Section */}
+              {syllabusData.resources && syllabusData.resources.filter((r: any) => r.kind !== 'video' && r.kind !== 'article').length > 0 && (
+                <div>
+                  <h4 className="font-semibold mb-2">Documents & Papers</h4>
+                  <ul className="space-y-1 text-sm">
+                    {syllabusData.resources.filter((r: any) => r.kind !== 'video' && r.kind !== 'article').map((resource: any, index: number) => (
+                      <li key={index}>
+                        <a
+                          href={resource.url}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="text-blue-600 hover:underline"
+                        >
+                          {resource.title} ({resource.kind})
+                        </a>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+            </div>
+          ) : (
+            <div className="text-center text-muted-foreground">Failed to load plan details</div>
+          )}
+        </DialogContent>
+      </Dialog>
     </Card>
   );
 }

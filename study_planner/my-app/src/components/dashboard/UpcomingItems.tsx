@@ -50,16 +50,37 @@ export function UpcomingItems() {
           ) : syllabusData ? (
             <div className="space-y-4">
               <h3 className="font-semibold text-lg">{selectedTopic}</h3>
-              {syllabusData.contents && syllabusData.contents.length > 0 ? (
-                syllabusData.contents.map((content: any, index: number) => (
-                  <div key={index} className="p-3 bg-muted/50 rounded-lg">
-                    <h4 className="font-medium mb-2">{content.title}</h4>
-                    <p className="text-sm text-muted-foreground">{content.description}</p>
-                  </div>
-                ))
+              {syllabusData.subtopics && syllabusData.subtopics.length > 0 ? (
+                <div>
+                  <h4 className="font-medium mb-2">Subtopics</h4>
+                  <ul className="list-disc list-inside space-y-1 text-sm">
+                    {syllabusData.subtopics.map((subtopic: string, index: number) => (
+                      <li key={index}>{subtopic}</li>
+                    ))}
+                  </ul>
+                </div>
               ) : (
-                <div className="text-center text-muted-foreground">No syllabus content available</div>
+                <div className="text-center text-muted-foreground">No subtopics available</div>
               )}
+              {syllabusData.resources && syllabusData.resources.length > 0 ? (
+                <div>
+                  <h4 className="font-medium mb-2">Resources</h4>
+                  <ul className="space-y-1 text-sm">
+                    {syllabusData.resources.map((resource: any, index: number) => (
+                      <li key={index}>
+                        <a
+                          href={resource.url}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="text-blue-600 hover:underline"
+                        >
+                          {resource.title} ({resource.kind})
+                        </a>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              ) : null}
             </div>
           ) : (
             <div className="text-center text-muted-foreground">Failed to load syllabus</div>
