@@ -9,7 +9,7 @@ groq==0.11.0
 h11==0.16.0
 httpcore==1.0.9
 httptools==0.7.1
-httpx==0.28.1
+httpx==0.27.2
 idna==3.11
 numpy==2.2.6
 pandas==2.2.2
@@ -27,6 +27,6 @@ typing-inspection==0.4.2
 typing_extensions==4.15.0
 tzdata==2025.2
 uvicorn==0.30.6
-#uvloop==0.21.0
+requests==2.32.4
 watchfiles==1.1.0
 websockets==15.0.1
