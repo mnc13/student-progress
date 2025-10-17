@@ -3,16 +3,12 @@ from __future__ import annotations
 """
 app/services/plan.py
 
-Unified planning module with:
-- Groq LLM initialization (tolerant to deprecated models or missing key)
-- LLM JSON call helper with fallback
-- Fallback task planning when LLM unavailable
-- LLM per-topic task planning (4–6 tasks)
-- Study task generation + persistence
-- Topic enrichment (subtopics + curated resources)
-- PubMed helpers (URL builders, MeSH, E-utilities)
-- Subtopic-map prompt that yields a stepwise "how to learn" plan
-- Convenience wrapper to attach PubMed bundle to the subtopic map
+Unified planning module:
+- Groq / LLM initialization tolerant to deprecation or missing key
+- JSON prompt + retry + fallback logic
+- Topic-plan prompt with basics / focus / study_path
+- Fallback task generator
+- Task persistence & enrichment logic
 """
 
 from datetime import timedelta, date
@@ -28,20 +24,20 @@ from app.core.config import settings
 
 log = logging.getLogger(__name__)
 
-# ========== Patch internal Groq httpx wrappers to drop unsupported "proxies" argument ==========
+# --- Patch internal Groq httpx wrappers to drop unsupported "proxies" kwarg ---
 try:
     from groq._base_client import SyncHttpxClientWrapper
     _orig_init = SyncHttpxClientWrapper.__init__
+
     def _patched_init(self, *args, **kwargs):
         kwargs.pop("proxies", None)
         return _orig_init(self, *args, **kwargs)
+
     SyncHttpxClientWrapper.__init__ = _patched_init
 except Exception:
-    # If the internal class layout is different, ignore
     pass
 
-# ========== Groq client initialization ==========
-
+# --- Groq client init ---
 _client = None
 def _init_groq_client():
     global _client
@@ -49,42 +45,33 @@ def _init_groq_client():
         _client = None
         return
     try:
-        from groq import Groq  # local import
+        from groq import Groq
         _client = Groq(api_key=settings.GROQ_API_KEY)
-        log.info("[LLM] Groq client initialized successfully.")
+        log.info("[LLM] Groq client initialized.")
     except Exception as e:
-        log.error("[LLM] Failed to initialize Groq client: %s", e, exc_info=True)
+        log.error("[LLM] initialization error: %s", e, exc_info=True)
         _client = None
 
 _init_groq_client()
 
-# Use configured model or a safer default
 DEFAULT_MODEL = getattr(settings, "GROQ_MODEL", "llama-3.3-70b-versatile")
 
-# ========== Prompts ==========
-
+# --- Prompts ---
 SYSTEM_TASK_PROMPT = (
     "You are a medical education coach for MBBS students. "
-    "Create concise, actionable tasks that use evidence-based strategies "
-    "(spaced repetition, active recall, case-based learning). "
-    "Keep tasks specific and time-bounded. Answer with JSON following schema."
+    "Create concise, actionable tasks using evidence-based strategies (active recall, cases, MCQs). "
+    "Output strict JSON."
 )
-
 SYSTEM_ENRICH_PROMPT = (
-    "You are an expert MBBS content curator. For each topic, list high-yield subtopics "
-    "and 3–6 relevant study resources (mix of articles/guidelines and YouTube videos). "
-    "Only include trustworthy sources; if unsure, omit. Return strict JSON."
+    "You are an MBBS content curator. For each topic, list 4-8 high-yield subtopics and 3-6 trusted resources (title, url, kind). "
+    "Return strict JSON."
 )
-
 SYSTEM_SUBTOPIC_MAP = (
-    "You are an MBBS academic coach. Extract granular, exam-relevant subtopics and build a concise, "
-    "stepwise study map that tells a student exactly what to learn under a topic and how to learn it. "
-    "Use evidence-based methods (spaced repetition, active recall, interleaving, case-based learning, error logs). "
-    "Return STRICT JSON only, no commentary."
+    "You are an MBBS academic coach. Extract exam-relevant subtopics and build a stepwise study map (modality, action, deliverable, time). "
+    "Return STRICT JSON, no commentary."
 )
 
 def _chat_json(messages: List[Dict[str, Any]], *, max_tokens: int = 2000) -> Optional[Dict[str, Any]]:
-    """Call Groq Chat Completions expecting JSON. Return parsed dict or None."""
     if _client is None:
         return None
     try:
@@ -97,17 +84,17 @@ def _chat_json(messages: List[Dict[str, Any]], *, max_tokens: int = 2000) -> Opt
         )
         content = resp.choices[0].message.content
     except Exception as e:
-        log.error("ERROR:plan:[LLM] chat failed: %s", e, exc_info=True)
+        log.error("[LLM] chat failed: %s", e, exc_info=True)
         return None
+
     import json
     try:
         return json.loads(content)
     except Exception as e:
-        log.error("ERROR:plan:[LLM] JSON parse failed: %s", e, exc_info=True)
+        log.error("[LLM] JSON parse failed: %s — content: %s", e, content, exc_info=True)
         return None
 
-# ========== PubMed / URL helpers ==========
-
+# --- PubMed & URL helpers ---
 def _pubmed_search_url(query: str, *, filters: Optional[Dict[str, str]] = None) -> str:
     base = "https://pubmed.ncbi.nlm.nih.gov/?term="
     url = base + quote_plus(query)
@@ -122,175 +109,185 @@ def _pubmed_esearch_url(query: str, *, retmax: int = 100) -> str:
     return base + params
 
 def _mesh_browse_url(term: str) -> str:
-    return (
-        "https://meshb.nlm.nih.gov/search?searchInField=term&sort=pertinence&size=200"
-        "&searchType=contains&query=" + quote_plus(term)
-    )
+    return "https://meshb.nlm.nih.gov/search?query=" + quote_plus(term)
 
-def _bookshelf_search_url(query: str) -> str:
-    return "https://www.ncbi.nlm.nih.gov/books/?term=" + quote_plus(query)
+def _bookshelf_search_url(q: str) -> str:
+    return "https://www.ncbi.nlm.nih.gov/books/?term=" + quote_plus(q)
 
-def _radiopaedia_search_url(query: str) -> str:
-    return "https://radiopaedia.org/search?lang=us&q=" + quote_plus(query)
+def _radiopaedia_search_url(q: str) -> str:
+    return "https://radiopaedia.org/search?lang=us&q=" + quote_plus(q)
 
 def _build_pubmed_queries(topic: str, subtopics: List[str]) -> Dict[str, Any]:
     topic_q = topic.strip()
     base_q = f"({topic_q})"
-    recent_filter = {"filter": "years.5"}
-
+    recent = {"filter": "years.5"}
     bundle: Dict[str, Any] = {
         "topic": topic_q,
         "overview": {
-            "pubmed_ui": _pubmed_search_url(base_q, filters=recent_filter),
+            "pubmed_ui": _pubmed_search_url(base_q, filters=recent),
             "pubmed_esearch": _pubmed_esearch_url(base_q),
             "mesh": _mesh_browse_url(topic_q),
             "bookshelf": _bookshelf_search_url(topic_q),
         },
         "angles": {
-            "recent_reviews": _pubmed_search_url(
-                f"{base_q} AND (review[Publication Type])", filters=recent_filter
-            ),
-            "guidelines": _pubmed_search_url(
-                f"{base_q} AND (guideline[Publication Type] OR practice guideline[Publication Type])",
-                filters=recent_filter,
-            ),
-            "clinical_trials": _pubmed_search_url(
-                f"{base_q} AND (randomized controlled trial[Publication Type] OR clinical trial[Publication Type])",
-                filters=recent_filter,
-            ),
-            "imaging": _pubmed_search_url(
-                f"{base_q} AND (diagnostic imaging[MeSH Terms] OR radiography OR ultrasound OR MRI OR CT)",
-                filters=recent_filter,
-            ),
+            "reviews": _pubmed_search_url(f"{base_q} AND (review[Publication Type])", filters=recent),
+            "guidelines": _pubmed_search_url(f"{base_q} AND (guideline[Publication Type])", filters=recent),
+            "imaging": _pubmed_search_url(f"{base_q} AND (diagnostic imaging[MeSH Terms])", filters=recent),
         },
         "by_subtopic": [],
-        "adjacent_resources": {
-            "radiopaedia": _radiopaedia_search_url(topic_q),
-        },
+        "adjacent": {"radiopaedia": _radiopaedia_search_url(topic_q)}
     }
-
     for st in (subtopics or [])[:10]:
-        st_q = st.strip()
-        if not st_q:
+        stq = st.strip()
+        if not stq:
             continue
-        q = f'("{topic_q}") AND ("{st_q}"[Title/Abstract] OR "{st_q}"[MeSH Terms])'
-        bundle["by_subtopic"].append(
-            {
-                "subtopic": st_q,
-                "pubmed_ui": _pubmed_search_url(q, filters=recent_filter),
-                "pubmed_esearch": _pubmed_esearch_url(q),
-                "mesh": _mesh_browse_url(st_q),
-            }
-        )
-
+        q = f'("{topic_q}") AND ("{stq}"[Title/Abstract] OR "{stq}"[MeSH Terms])'
+        bundle["by_subtopic"].append({
+            "subtopic": stq,
+            "pubmed_ui": _pubmed_search_url(q, filters=recent),
+            "pubmed_esearch": _pubmed_esearch_url(q),
+            "mesh": _mesh_browse_url(stq),
+        })
     return bundle
 
-# ========== Fallback plan (if LLM fails or is unavailable) ==========
-
+# --- Fallback plan for tasks ---
 def _fallback_plan(upc: UpcomingEvent, weak_topics: List[str]) -> List[Dict[str, Any]]:
-    log.info("[LLM] Using fallback plan for topic=%s (no LLM)", upc.topic)
+    log.info("[LLM] using fallback plan for %s", upc.topic)
     due = upc.date
     blocks = [
-        {"title": f"Core reading: {upc.topic}", "days_before": 7, "hours": max(1, upc.hours // 5)},
-        {"title": f"Active recall (flashcards): {upc.topic}", "days_before": 5, "hours": max(1, upc.hours // 6)},
-        {"title": f"Clinical cases & images: {upc.topic}", "days_before": 3, "hours": max(1, upc.hours // 6)},
-        {"title": "MCQ practice + review weak areas", "days_before": 2, "hours": max(1, upc.hours // 6)},
-        {"title": "Final revision & rest", "days_before": 0, "hours": 1},
+        {"title": f"Read core concepts of {upc.topic}", "days_before": 7, "hours": max(1, upc.hours//5)},
+        {"title": f"Active recall: {upc.topic}", "days_before": 5, "hours": max(1, upc.hours//6)},
+        {"title": f"Case studies & images: {upc.topic}", "days_before": 3, "hours": max(1, upc.hours//6)},
+        {"title": f"MCQ practice & review: {upc.topic}", "days_before": 2, "hours": max(1, upc.hours//6)},
+        {"title": f"Final summary & test: {upc.topic}", "days_before": 0, "hours": 1},
     ]
     if weak_topics:
-        blocks.insert(
-            1,
-            {
-                "title": f"Remediate weak topic(s): {', '.join(weak_topics[:2])}",
-                "days_before": 6,
-                "hours": 2,
-            },
-        )
-    return [
-        {
-            "title": b["title"],
-            "due_date": (due - timedelta(days=b["days_before"])).isoformat(),
-            "hours": b["hours"],
+        blocks.insert(1, {
+            "title": f"Remediate weak: {', '.join(weak_topics[:2])}",
+            "days_before": 6,
+            "hours": 2
+        })
+    tasks: List[Dict[str, Any]] = []
+    for b in blocks:
+        d = (due - timedelta(days=b["days_before"])).isoformat()
+        tasks.append({"title": b["title"], "due_date": d, "hours": b["hours"], "topic": upc.topic})
+    return tasks
+
+# --- New: LLM topic plan with “basics / focus / study_path” prompt ---
+def _llm_topic_plan_with_path(
+    upc: UpcomingEvent, weak_topics: List[str]
+) -> List[Dict[str, Any]]:
+    # Build the prompt
+    user = {
+        "role": "user",
+        "content": f"""
+You are a medical education coach.  
+
+Topic: "{upc.topic}"
+Historically weak subtopics: {', '.join(weak_topics)}  
+
+Produce EXACT JSON with this schema (no extra keys):
+{{
+  "topic": "str",
+  "basics": ["str", ...],
+  "focus": ["str", ...],
+  "study_path": [
+    {{
+      "step": 1,
+      "modality": "Active Recall",
+      "target": "str",
+      "deliverable": "str"
+    }},
+    {{
+      "step": 2,
+      "modality": "Case-based Learning",
+      "target": "str",
+      "deliverable": "str"
+    }},
+    {{
+      "step": 3,
+      "modality": "MCQ Practice",
+      "target": "str",
+      "deliverable": "str"
+    }},
+    {{
+      "step": 4,
+      "modality": "Review",
+      "target": "str",
+      "deliverable": "str"
+    }}
+  ]
+}}
+"""
+    }
+    messages = [{"role": "system", "content": SYSTEM_TASK_PROMPT}, user]
+
+    data = _chat_json(messages)
+    if not (isinstance(data, dict) and "study_path" in data and "basics" in data):
+        log.warning("[LLM] detailed plan with path failed for %s, fallback to simpler plan", upc.topic)
+        return []  # fallback upstream will handle
+
+    # Translate study_path into tasks
+    tasks: List[Dict[str, Any]] = []
+    for step in data["study_path"]:
+        mod = step.get("modality")
+        tgt = step.get("target")
+        title = f"{mod}: {tgt}" if tgt else mod
+        tasks.append({
+            "title": title,
             "topic": upc.topic,
-        }
-        for b in blocks
-    ]
+            "modality": mod,
+            "focus": [tgt] if tgt else []
+        })
+    return tasks
 
-# ========== LLM per-topic plan ==========
-
+# --- Existing LLM topic plan (fallback) ---
 def _llm_topic_plan(upc: UpcomingEvent, weak_topics: List[str]) -> List[Dict[str, Any]]:
     messages = [
         {"role": "system", "content": SYSTEM_TASK_PROMPT},
         {
             "role": "user",
             "content": f"""
-Create a short study plan for a single upcoming topic.
+Create a short study plan for topic "{upc.topic}". Available hours: {upc.hours}. Weak topics: {', '.join(weak_topics)}.
 
-Context:
-- Course: {upc.course}
-- Topic: {upc.topic}
-- Event date: {upc.date}
-- Available study hours for this topic: ~{upc.hours}
-- Historically weak topics in this course: {', '.join(weak_topics) if weak_topics else 'None'}
-
-Requirements:
-- Output 4–6 tasks, each with:
-  - "title": concise action
-  - "topic": "{upc.topic}"
-  - "due_date": YYYY-MM-DD between today and {upc.date}
-  - "hours": integer between 1 and 3; the sum should be close to {upc.hours}
-  - "subtopics": 3–7 bullets
-  - "resources": 2–5 items; each is {{ "title": str, "url": str, "kind": "web"|"youtube" }}
-- Prefer active recall, images, cases, MCQs.
-- STRICT JSON with this schema:
-{{  "tasks": [  {{ "title": "str", "topic": "str", "due_date": "YYYY-MM-DD", "hours": 1, "subtopics": ["str", "..."], "resources": [{{"title":"str","url":"str","kind":"web|youtube"}}]  }} ] }}
-""".strip(),
+Output strict JSON:
+{{ "tasks": [ {{ "title":"str", "topic":"str", "due_date":"YYYY-MM-DD", "hours": int, "subtopics":["str"], "resources":[{{"title","url","kind"}}] }} ] }}
+"""
         },
     ]
     data = _chat_json(messages)
     if not data or "tasks" not in data or not isinstance(data["tasks"], list):
         return []
-
     tasks: List[Dict[str, Any]] = []
     for t in data["tasks"]:
         try:
-            due_str = str(t["due_date"])
-            try:
-                dd = date.fromisoformat(due_str)
-                if dd > upc.date:
-                    due_str = upc.date.isoformat()
-            except Exception:
-                due_str = upc.date.isoformat()
-
+            due = t["due_date"]
             hrs = int(t.get("hours", 1))
-            hrs = max(1, min(3, hrs))
-
-            tasks.append(
-                {
-                    "title": str(t["title"])[:200],
-                    "topic": upc.topic,
-                    "due_date": due_str,
-                    "hours": hrs,
-                    "subtopics": list(t.get("subtopics", []))[:10],
-                    "resources": list(t.get("resources", []))[:6],
-                }
-            )
+            title = t["title"]
+            sub = list(t.get("subtopics", []))
+            res = list(t.get("resources", []))
+            tasks.append({
+                "title": title,
+                "topic": upc.topic,
+                "due_date": due,
+                "hours": hrs,
+                "subtopics": sub,
+                "resources": res,
+            })
         except Exception:
             continue
-
     return tasks
 
-# ========== Persist tasks to DB ==========
-
+# --- Persist tasks to DB + orchestration ---
 def generate_study_tasks(
     db: Session,
     student_id: int,
     course: str,
     *,
     final_only: bool = False,
-    use_llm: bool = True,
+    use_llm: bool = True
 ) -> List[StudyTask]:
-    upcomings = db.scalars(
+    upcs = db.scalars(
         select(UpcomingEvent).where(
             UpcomingEvent.student_id == student_id,
             UpcomingEvent.course == course,
@@ -300,49 +297,49 @@ def generate_study_tasks(
     past = db.scalars(
         select(PastItem).where(PastItem.student_id == student_id, PastItem.course == course)
     ).all()
-    weak_topics = [p.topic for p in past if (p.mark or 0.0) < 0.5]
+    weak = [p.topic for p in past if (p.mark or 0.0) < 0.5]
 
     created: List[StudyTask] = []
-
     if use_llm and _client is None:
-        log.error("[LLM] Requested but unavailable (no key)")
-        raise RuntimeError("LLM requested but not available")
+        raise RuntimeError("LLM requested but not configured")
 
-    for upc in upcomings:
-        db.execute(
-            delete(StudyTask).where(
-                StudyTask.student_id == student_id,
-                StudyTask.course == course,
-                StudyTask.event_idx == upc.idx,
-            )
-        )
+    for upc in upcs:
+        db.execute(delete(StudyTask).where(
+            StudyTask.student_id == student_id,
+            StudyTask.course == course,
+            StudyTask.event_idx == upc.idx
+        ))
 
-        tasks_json: List[Dict[str, Any]] = []
+        # Try new detailed variant first
+        tasks_json = []
         if use_llm:
-            tasks_json = _llm_topic_plan(upc, weak_topics)
+            tasks_json = _llm_topic_plan_with_path(upc, weak)
             if not tasks_json:
-                log.warning("[LLM] Returned no tasks for topic=%s; falling back.", upc.topic)
+                log.info("[LLM] fallback to simpler topic plan for %s", upc.topic)
+                tasks_json = _llm_topic_plan(upc, weak)
+            if not tasks_json:
+                log.warning("[LLM] no tasks via LLM for %s; fallback plan", upc.topic)
 
         if not tasks_json:
-            tasks_json = _fallback_plan(upc, weak_topics)
+            tasks_json = _fallback_plan(upc, weak)
 
+        # Postprocess & persist
         for t in tasks_json:
             try:
-                due = date.fromisoformat(str(t["due_date"]))
-                hours = int(t.get("hours", 1))
-                title = str(t["title"])[:200]
-                topic_for_row = (t.get("topic") or upc.topic)[:120]
+                due = date.fromisoformat(str(t.get("due_date", upc.date.isoformat())))
             except Exception:
-                continue
-
+                due = upc.date
+            hrs = int(t.get("hours", 1) or 1)
+            title = str(t.get("title", ""))[:200]
+            topic_for_row = (t.get("topic") or upc.topic)[:120]
             row = StudyTask(
                 student_id=student_id,
-                course=upc.course,
+                course=course,
                 event_idx=upc.idx,
                 title=title,
                 topic=topic_for_row,
                 due_date=due,
-                hours=hours,
+                hours=hrs,
                 status="not_started",
                 completion_percent=0,
             )
@@ -352,154 +349,48 @@ def generate_study_tasks(
     db.commit()
     return created
 
-# ========== Topic enrichment (subtopics + resources + PubMed) ==========
-
+# --- Enrichment with fallback for JSON errors ---
 def fetch_topic_enrichment(course: str, topics: List[str]) -> Dict[str, Dict[str, Any]]:
-    """
-    Returns per-topic enrichment including subtopics, curated resources, and PubMed URL bundles.
-    If JSON generation fails (e.g. json_validate_failed), fall back gracefully.
-    """
     import json
-    # fallback deterministic path if LLM unavailable
     if _client is None:
-        out: Dict[str, Dict[str, Any]] = {}
-        for t in topics:
-            subs = [
-                f"{t}: core concepts",
-                f"{t}: clinical relevance",
-                f"{t}: imaging/cadaveric correlation",
-                f"{t}: MCQ pitfalls",
-            ]
-            res = [
-                {
-                    "title": f"{t} overview (article)",
-                    "url": f"https://www.ncbi.nlm.nih.gov/search/all/?term={t.replace(' ', '%20')}",
-                    "kind": "article",
-                },
-                {
-                    "title": f"{t} lecture (YouTube)",
-                    "url": f"https://www.youtube.com/results?search_query={t.replace(' ', '+')}+mbbs",
-                    "kind": "video",
-                },
-                {
-                    "title": f"{t} images/atlas",
-                    "url": f"https://radiopaedia.org/search?lang=us&q={t.replace(' ', '%20')}",
-                    "kind": "site",
-                },
-            ]
-            out[t] = {"subtopics": subs, "resources": res}
-            out[t]["pubmed"] = _build_pubmed_queries(t, subs)
-        return out
-
-    user_prompt = {
-        "role": "user",
-        "content": (
-            "You are a medical education assistant for MBBS students.\n"
-            f"Course: {course}\n"
-            f"Topics: {topics}\n"
-            "For EACH topic, produce 4–8 concise subtopics and 4–6 curated resources (title, url, kind: video|article|site). Prefer reputable sources. Output strict JSON.\n"
-            '{ "Topic": { "subtopics": ["..."], "resources":[{"title":"...","url":"...","kind":"video|article|site"}] } }'
-        ),
-    }
-
-    try:
-        resp = _client.chat.completions.create(
-            model=DEFAULT_MODEL,
-            temperature=0.2,
-            max_tokens=1200,
-            messages=[{"role": "system", "content": "Return JSON only."}, user_prompt],
-            response_format={"type": "json_object"},
-        )
-        content = resp.choices[0].message.content
-        parsed = json.loads(content)
-    except Exception as e:
-        # If it's a Groq BadRequest / json_validate_failed, fallback
-        try:
-            import groq
-            if isinstance(e, groq.BadRequestError):
-                # Try inspect response body
-                body = getattr(e, "response", None)
-                if body:
-                    try:
-                        errjson = body.json()
-                    except Exception:
-                        errjson = {}
-                    err = errjson.get("error", {})
-                    if err.get("code") == "json_validate_failed":
-                        failed = err.get("failed_generation")
-                        log.warning("[LLM] enrichment json_validate_failed for topics %s. failed_generation: %s", topics, failed)
-                        # fallback path
-                        # Build minimal output for each topic
-                        fallback: Dict[str, Dict[str, Any]] = {}
-                        for t in topics:
-                            subs = [
-                                f"{t}: core concepts",
-                                f"{t}: MCQ pitfalls"
-                            ]
-                            res = [
-                                {
-                                    "title": f"{t} search (PubMed)",
-                                    "url": f"https://pubmed.ncbi.nlm.nih.gov/?term={t.replace(' ', '%20')}",
-                                    "kind": "article",
-                                },
-                            ]
-                            fallback[t] = {"subtopics": subs, "resources": res}
-                            fallback[t]["pubmed"] = _build_pubmed_queries(t, subs)
-                        return fallback
-        except ImportError:
-            pass
-
-        log.error("[LLM] enrichment failed unexpectedly for topics %s: %s", topics, e, exc_info=True)
         # fallback deterministic
         out: Dict[str, Dict[str, Any]] = {}
         for t in topics:
-            subs = [
-                f"{t}: core concepts",
-                f"{t}: clinical relevance",
-                f"{t}: imaging/cadaveric correlation",
-                f"{t}: MCQ pitfalls",
-            ]
+            subs = [f"{t}: core concepts", f"{t}: clinical relevance", f"{t}: imaging", f"{t}: MCQ pitfalls"]
             res = [
-                {
-                    "title": f"{t} overview (article)",
-                    "url": f"https://www.ncbi.nlm.nih.gov/search/all/?term={t.replace(' ', '%20')}",
-                    "kind": "article",
-                },
-                {
-                    "title": f"{t} lecture (YouTube)",
-                    "url": f"https://www.youtube.com/results?search_query={t.replace(' ', '+')}+mbbs",
-                    "kind": "video",
-                },
-                {
-                    "title": f"{t} images/atlas",
-                    "url": f"https://radiopaedia.org/search?lang=us&q={t.replace(' ', '%20')}",
-                    "kind": "site",
-                },
+                {"title": f"{t} overview", "url": f"https://pubmed.ncbi.nlm.nih.gov/?term={t.replace(' ', '%20')}", "kind": "article"},
+                {"title": f"{t} lecture", "url": f"https://www.youtube.com/results?search_query={t.replace(' ', '+')}+mbbs", "kind": "video"},
             ]
             out[t] = {"subtopics": subs, "resources": res}
             out[t]["pubmed"] = _build_pubmed_queries(t, subs)
         return out
 
-    # Normal path: parse successful JSON
+    user = {
+        "role": "user",
+        "content": (
+            "You are an expert MBBS content curator. Topics: " + ", ".join(topics) +
+            "\nReturn strict JSON mapping each topic to {subtopics: [..], resources: [..]}. "\
+            "4-8 subtopics and 3-6 resources each. No commentary."
+        )
+    }
+    messages = [{"role": "system", "content": SYSTEM_ENRICH_PROMPT}, user]
+
+    parsed = _chat_json(messages)
+    if parsed is None:
+        log.warning("[LLM] enrichment JSON failed, using fallback for %s", topics)
+        return fetch_topic_enrichment(course, topics)  # recursion but will go fallback path if _client is None
+
     out: Dict[str, Dict[str, Any]] = {}
     for t in topics:
-        node = parsed.get(t) if isinstance(parsed, dict) else None
+        node = parsed.get(t)
         if not isinstance(node, dict):
-            # fallback for that topic
             subs = [f"{t}: core concepts", f"{t}: MCQ pitfalls"]
-            res = [
-                {
-                    "title": f"{t} search (PubMed)",
-                    "url": f"https://pubmed.ncbi.nlm.nih.gov/?term={t.replace(' ', '%20')}",
-                    "kind": "article",
-                }
-            ]
+            res = [{"title": f"{t} fallback", "url": f"https://pubmed.ncbi.nlm.nih.gov/?term={t.replace(' ', '%20')}", "kind": "article"}]
             out[t] = {"subtopics": subs, "resources": res}
-            out[t]["pubmed"] = _build_pubmed_queries(t, subs)
         else:
-            subs = [str(s) for s in (node.get("subtopics") or [])][:12]
+            subs = [str(s) for s in node.get("subtopics", [])][:8]
             clean_res: List[Dict[str, str]] = []
-            for r in (node.get("resources") or [])[:10]:
+            for r in (node.get("resources") or [])[:6]:
                 try:
                     clean_res.append({
                         "title": str(r.get("title", ""))[:200],
@@ -509,11 +400,10 @@ def fetch_topic_enrichment(course: str, topics: List[str]) -> Dict[str, Dict[str
                 except Exception:
                     continue
             out[t] = {"subtopics": subs, "resources": clean_res}
-            out[t]["pubmed"] = _build_pubmed_queries(t, subs)
+        out[t]["pubmed"] = _build_pubmed_queries(t, out[t]["subtopics"])
     return out
 
-# ========== Subtopic map & path ==========
-
+# --- Subtopic map endpoints ---
 def subtopic_map_user_prompt(topic: str, course: str) -> Dict[str, str]:
     return {
         "role": "user",
@@ -521,45 +411,22 @@ def subtopic_map_user_prompt(topic: str, course: str) -> Dict[str, str]:
 Course: {course}
 Topic: {topic}
 
-Goals:
-- List 8–16 granular, MBBS-relevant subtopics (grouped by logical sections).
-- Produce a stepwise 'how to learn' map: for each step specify modality, concrete action, deliverable, and time box.
-- Include an 'assessment' step (timed MCQs + error log) and an 'images/cases' step.
-- Suggest 3–6 trusted resource hints (titles only; no URLs needed here).
-- If subtopics imply radiology/surface anatomy/OSCE, include a dedicated step for that.
-
-STRICT JSON SCHEMA:
+Produce STRICT JSON:
 {{
   "topic": "str",
-  "subtopics": [
-    {{"section": "str", "items": ["str", "..."]}}
-  ],
-  "study_path": [
-    {{
-      "step": 1,
-      "title": "str (imperative, <=100 chars)",
-      "modality": "Reading|Anki|MCQ|Cases|Diagram|OSCE",
-      "action": "str (what exactly to do)",
-      "deliverable": "str (e.g., concept map, error log, labeled diagram)",
-      "time_box_hours": 1
-    }}
-  ],
-  "resource_hints": ["str", "..."]
+  "subtopics": [ {{ "section":"str", "items":["str", ...] }} ],
+  "study_path": [ {{ "step":1, "title":"str","modality":"Reading|Anki|MCQ|Cases|OSCE", "action":"str", "deliverable":"str", "time_box_hours":1 }} ],
+  "resource_hints": ["str", ...]
 }}
 """
     }
 
 def fetch_subtopic_map(topic: str, course: str) -> Optional[Dict[str, Any]]:
-    try:
-        data = _chat_json([{"role": "system", "content": SYSTEM_SUBTOPIC_MAP},
-                           subtopic_map_user_prompt(topic, course)],
-                          max_tokens=1400)
-    except Exception as e:
-        log.error("[LLM] subtopic_map failed for topic %s: %s", topic, e, exc_info=True)
-        return None
+    data = _chat_json([{"role": "system", "content": SYSTEM_SUBTOPIC_MAP}, subtopic_map_user_prompt(topic, course)],
+                      max_tokens=1400)
     if not isinstance(data, dict):
+        log.warning("[LLM] subtopic_map JSON invalid for %s", topic)
         return None
-    # Optionally sanitize fields
     data["topic"] = str(data.get("topic", topic))[:200]
     data["subtopics"] = data.get("subtopics", [])
     data["study_path"] = data.get("study_path", [])
@@ -567,12 +434,12 @@ def fetch_subtopic_map(topic: str, course: str) -> Optional[Dict[str, Any]]:
     return data
 
 def fetch_subtopic_map_with_pubmed(topic: str, course: str) -> Optional[Dict[str, Any]]:
-    data = fetch_subtopic_map(topic, course)
-    if not data:
+    m = fetch_subtopic_map(topic, course)
+    if not m:
         return None
     sub_items: List[str] = []
-    for sec in data.get("subtopics", []):
+    for sec in m.get("subtopics", []):
         sub_items.extend(sec.get("items", []))
     sub_items = [s for s in sub_items if s][:12]
-    data["pubmed"] = _build_pubmed_queries(topic, sub_items)
-    return data
+    m["pubmed"] = _build_pubmed_queries(topic, sub_items)
+    return m
