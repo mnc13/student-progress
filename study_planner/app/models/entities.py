@@ -39,3 +39,4 @@ class StudyTask(Base):
     hours = Column(Integer, nullable=False, default=1)
     status = Column(String, nullable=False, default="not_started")
     completion_percent = Column(Integer, nullable=False, default=0)
+    context = Column(String, nullable=True)

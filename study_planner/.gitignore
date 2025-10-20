@@ -66,3 +66,6 @@ data/*.parquet
 # alembic/ (keep this tracked unless it's purely local)
 
 # --- Coverage / repo
+data
+anatomy_v3.pdf
+anatomy.pdf
