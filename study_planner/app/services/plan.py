@@ -15,12 +15,14 @@ from datetime import timedelta, date
 from typing import List, Dict, Any, Optional
 import logging
 from urllib.parse import quote_plus
+import json  # <-- NEW: needed for storing RAG context as JSON
 
 from sqlalchemy.orm import Session
 from sqlalchemy import select, delete
 
 from app.models.entities import PastItem, UpcomingEvent, StudyTask
 from app.core.config import settings
+from app.rag_retriever import retrieve_context
 
 log = logging.getLogger(__name__)
 
@@ -74,25 +76,33 @@ SYSTEM_SUBTOPIC_MAP = (
 def _chat_json(messages: List[Dict[str, Any]], *, max_tokens: int = 2000) -> Optional[Dict[str, Any]]:
     if _client is None:
         return None
-    try:
-        resp = _client.chat.completions.create(
-            model=DEFAULT_MODEL,
-            temperature=0.2,
-            max_tokens=max_tokens,
-            response_format={"type": "json_object"},
-            messages=messages,
-        )
-        content = resp.choices[0].message.content
-    except Exception as e:
-        log.error("[LLM] chat failed: %s", e, exc_info=True)
-        return None
 
-    import json
-    try:
-        return json.loads(content)
-    except Exception as e:
-        log.error("[LLM] JSON parse failed: %s — content: %s", e, content, exc_info=True)
-        return None
+    import time
+    import json as _json
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            resp = _client.chat.completions.create(
+                model=DEFAULT_MODEL,
+                temperature=0.2,
+                max_tokens=max_tokens,
+                response_format={"type": "json_object"},
+                messages=messages,
+            )
+            content = resp.choices[0].message.content
+            return _json.loads(content)
+        except Exception as e:
+            error_msg = str(e).lower()
+            if "rate limit" in error_msg and attempt < max_retries - 1:
+                wait_time = 2 ** attempt  # exponential backoff: 1, 2, 4 seconds
+                log.warning("[LLM] Rate limit hit, retrying in %d seconds (attempt %d/%d): %s", wait_time, attempt + 1, max_retries, e)
+                time.sleep(wait_time)
+                continue
+            else:
+                log.error("[LLM] chat failed after %d attempts: %s", attempt + 1, e, exc_info=True)
+                return None
+
+    return None
 
 # --- PubMed & URL helpers ---
 def _pubmed_search_url(query: str, *, filters: Optional[Dict[str, str]] = None) -> str:
@@ -285,14 +295,18 @@ def generate_study_tasks(
     course: str,
     *,
     final_only: bool = False,
-    use_llm: bool = True
+    use_llm: bool = True,
+    only_topic: Optional[str] = None,  # <-- NEW: generate only a single topic if provided
 ) -> List[StudyTask]:
-    upcs = db.scalars(
-        select(UpcomingEvent).where(
-            UpcomingEvent.student_id == student_id,
-            UpcomingEvent.course == course,
-        )
-    ).all()
+    # Build UpcomingEvent query, optionally filtering by one topic
+    upcs_q = select(UpcomingEvent).where(
+        UpcomingEvent.student_id == student_id,
+        UpcomingEvent.course == course,
+    )
+    if only_topic:
+        upcs_q = upcs_q.where(UpcomingEvent.topic == only_topic)
+
+    upcs = db.scalars(upcs_q).all()
 
     past = db.scalars(
         select(PastItem).where(PastItem.student_id == student_id, PastItem.course == course)
@@ -323,6 +337,32 @@ def generate_study_tasks(
         if not tasks_json:
             tasks_json = _fallback_plan(upc, weak)
 
+        # ---------- UPDATED: Anatomy RAG JSON with chapter + page ----------
+        if course.lower() == "anatomy":
+            topic_context_cache: Dict[str, str] = {}
+            for t in tasks_json:
+                topic = t.get("topic", "")
+                if not topic:
+                    continue
+                if topic not in topic_context_cache:
+                    try:
+                        hits = retrieve_context(topic, top_k=3) or []
+                        mapped = []
+                        for h in hits:
+                            src = (h.get("source") or {})
+                            mapped.append({
+                                "chapter": src.get("chapter", "Unknown Chapter"),
+                                "page": int(src.get("page", 0) or 0),
+                                "file": src.get("file", "anatomy_v3.pdf"),
+                                "preview": (h.get("text") or "")[:240].replace("\n", " ")
+                            })
+                        topic_context_cache[topic] = json.dumps({"human_anatomy": mapped})
+                    except Exception as e:
+                        log.warning("[RAG] Failed to retrieve context for %s: %s", topic, e)
+                        topic_context_cache[topic] = json.dumps({"human_anatomy": []})
+                t["context"] = topic_context_cache[topic]
+        # -------------------------------------------------------------------
+
         # Postprocess & persist
         for t in tasks_json:
             try:
@@ -342,6 +382,7 @@ def generate_study_tasks(
                 hours=hrs,
                 status="not_started",
                 completion_percent=0,
+                context=t.get("context", ""),
             )
             db.add(row)
             created.append(row)
@@ -351,7 +392,7 @@ def generate_study_tasks(
 
 # --- Enrichment with fallback for JSON errors ---
 def fetch_topic_enrichment(course: str, topics: List[str]) -> Dict[str, Dict[str, Any]]:
-    import json
+    import json as _json
     if _client is None:
         # fallback deterministic
         out: Dict[str, Dict[str, Any]] = {}
@@ -369,7 +410,7 @@ def fetch_topic_enrichment(course: str, topics: List[str]) -> Dict[str, Dict[str
         "role": "user",
         "content": (
             "You are an expert MBBS content curator. Topics: " + ", ".join(topics) +
-            "\nReturn strict JSON mapping each topic to {subtopics: [..], resources: [..]}. "\
+            "\nReturn strict JSON mapping each topic to {subtopics: [..], resources: [..]}. "
             "4-8 subtopics and 3-6 resources each. No commentary."
         )
     }
@@ -378,7 +419,17 @@ def fetch_topic_enrichment(course: str, topics: List[str]) -> Dict[str, Dict[str
     parsed = _chat_json(messages)
     if parsed is None:
         log.warning("[LLM] enrichment JSON failed, using fallback for %s", topics)
-        return fetch_topic_enrichment(course, topics)  # recursion but will go fallback path if _client is None
+        # Compute fallback directly without recursion
+        out: Dict[str, Dict[str, Any]] = {}
+        for t in topics:
+            subs = [f"{t}: core concepts", f"{t}: clinical relevance", f"{t}: imaging", f"{t}: MCQ pitfalls"]
+            res = [
+                {"title": f"{t} overview", "url": f"https://pubmed.ncbi.nlm.nih.gov/?term={t.replace(' ', '%20')}", "kind": "article"},
+                {"title": f"{t} lecture", "url": f"https://www.youtube.com/results?search_query={t.replace(' ', '+')}+mbbs", "kind": "video"},
+            ]
+            out[t] = {"subtopics": subs, "resources": res}
+            out[t]["pubmed"] = _build_pubmed_queries(t, subs)
+        return out
 
     out: Dict[str, Dict[str, Any]] = {}
     for t in topics:

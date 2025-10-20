@@ -39,6 +39,7 @@ class StudyTaskOut(BaseModel):
     hours: int
     status: str
     completion_percent: int
+    context: Optional[str] = None
 
 class ProgressSummary(BaseModel):
     event_idx: int

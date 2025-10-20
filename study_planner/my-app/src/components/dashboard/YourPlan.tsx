@@ -5,7 +5,7 @@ import { useAuth } from "@/contexts/AuthContext";
 import { api } from "@/lib/api";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { Button } from "@/components/ui/button";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, useMemo } from "react";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 
 export function YourPlan() {
@@ -18,13 +18,14 @@ export function YourPlan() {
 
   const { data: tasks, isLoading, isFetching } = useQuery({
     queryKey: ["tasks", studentId, selectedCourse],
-    queryFn: () => studentId ? api.getTasks(parseInt(studentId), selectedCourse || undefined) : Promise.resolve([]),
+    queryFn: () =>
+      studentId ? api.getTasks(parseInt(studentId), selectedCourse || undefined) : Promise.resolve([]),
     enabled: !!studentId && !!selectedCourse,
   });
 
   const { data: syllabusData, isLoading: syllabusLoading } = useQuery({
     queryKey: ["syllabus", selectedTopic, selectedCourse],
-    queryFn: () => selectedTopic ? api.getSyllabus(selectedCourse!, selectedTopic) : Promise.resolve(null),
+    queryFn: () => (selectedTopic ? api.getSyllabus(selectedCourse!, selectedTopic) : Promise.resolve(null)),
     enabled: !!selectedTopic && !!selectedCourse,
   });
 
@@ -38,7 +39,6 @@ export function YourPlan() {
   // Auto-generate plan if no tasks exist for the selected course
   useEffect(() => {
     if (studentId && selectedCourse && !isLoading && !isFetching && !generatePlanMutation.isPending) {
-      // Only generate if we have data and it's empty, or if query completed with no data
       const shouldGenerate = !tasks || (Array.isArray(tasks) && tasks.length === 0);
       if (shouldGenerate) {
         generatePlanMutation.mutate();
@@ -50,25 +50,15 @@ export function YourPlan() {
     mutationFn: ({ taskId, status }: { taskId: number; status: string }) =>
       api.updateTask(parseInt(studentId!), taskId, { status }),
     onMutate: async ({ taskId, status }) => {
-      // Cancel any outgoing refetches
       await queryClient.cancelQueries({ queryKey: ["tasks", studentId, selectedCourse] });
-
-      // Snapshot the previous value
       const previousTasks = queryClient.getQueryData(["tasks", studentId, selectedCourse]);
-
-      // Optimistically update to the new value
       queryClient.setQueryData(["tasks", studentId, selectedCourse], (old: any) => {
         if (!old) return old;
-        return old.map((task: any) =>
-          task.id === taskId ? { ...task, status } : task
-        );
+        return old.map((task: any) => (task.id === taskId ? { ...task, status } : task));
       });
-
-      // Return a context object with the snapshotted value
       return { previousTasks };
     },
     onError: (err, { taskId, status }, context) => {
-      // If the mutation fails, use the context returned from onMutate to roll back
       if (context?.previousTasks) {
         queryClient.setQueryData(["tasks", studentId, selectedCourse], context.previousTasks);
       }
@@ -79,7 +69,6 @@ export function YourPlan() {
   });
 
   const handleTaskUpdate = (taskId: number, status: string) => {
-    // Store current scroll position before mutation
     if (scrollRef.current) {
       scrollPositionRef.current = scrollRef.current.scrollTop;
     }
@@ -97,14 +86,55 @@ export function YourPlan() {
   };
 
   // Group tasks by topic
-  const groupedTasks: { [key: string]: any[] } = {};
-  if (tasks) {
-    tasks.forEach((task: any) => {
-      const key = task.topic;
-      if (!groupedTasks[key]) groupedTasks[key] = [];
-      groupedTasks[key].push(task);
-    });
-  }
+  const groupedTasks: { [key: string]: any[] } = useMemo(() => {
+    const g: { [key: string]: any[] } = {};
+    if (tasks) {
+      tasks.forEach((task: any) => {
+        const key = task.topic;
+        if (!g[key]) g[key] = [];
+        g[key].push(task);
+      });
+    }
+    return g;
+  }, [tasks]);
+
+  // ---- NEW: parse Anatomy RAG context from tasks for selected topic (non-breaking) ----
+  const humanAnatomyCitations = useMemo(() => {
+    if (!selectedTopic || !selectedCourse) return [];
+    if (selectedCourse.toLowerCase() !== "anatomy") return [];
+    const topicTasks = groupedTasks[selectedTopic] || [];
+    // Find first task that has a context payload
+    for (const t of topicTasks) {
+      const raw = t?.context;
+      if (!raw) continue;
+      try {
+        const parsed = typeof raw === "string" ? JSON.parse(raw) : raw;
+        const arr = parsed?.human_anatomy;
+        if (Array.isArray(arr)) {
+          // De-dup a bit by (chapter+page)
+          const seen = new Set<string>();
+          const dedup = [];
+          for (const item of arr) {
+            const k = `${item?.chapter ?? ""}::${item?.page ?? ""}`;
+            if (seen.has(k)) continue;
+            seen.add(k);
+            dedup.push(item);
+          }
+          return dedup;
+        }
+      } catch {
+        // ignore parse errors silently
+      }
+    }
+    return [];
+  }, [selectedTopic, selectedCourse, groupedTasks]);
+
+  // Collect unique pages for display
+  const uniquePages = useMemo(() => {
+    const pages = humanAnatomyCitations.map((c: any) => c?.page).filter(p => p != null && p > 0);
+    return [...new Set(pages)].sort((a, b) => a - b);
+  }, [humanAnatomyCitations]);
+  // -------------------------------------------------------------------------------------
 
   return (
     <Card className="flex flex-col shadow-xl shadow-blue-200/60">
@@ -112,19 +142,14 @@ export function YourPlan() {
         <CardTitle className="text-base font-semibold">Your Plan</CardTitle>
       </CardHeader>
       <CardContent ref={scrollRef} className="overflow-y-auto max-h-[400px] space-y-4">
-        {(isLoading || isFetching) ? (
+        {isLoading || isFetching ? (
           <div className="text-center text-muted-foreground">Loading...</div>
         ) : Object.keys(groupedTasks).length > 0 ? (
           Object.entries(groupedTasks).map(([topic, topicTasks]) => (
             <div key={topic}>
               <div className="flex items-center justify-between mb-2">
                 <h4 className="font-semibold">{topic}</h4>
-                <Button
-                  variant="outline"
-                  size="sm"
-                  onClick={() => handleViewPlan(topic)}
-                  className="text-xs"
-                >
+                <Button variant="outline" size="sm" onClick={() => handleViewPlan(topic)} className="text-xs">
                   View Plan
                 </Button>
               </div>
@@ -157,6 +182,21 @@ export function YourPlan() {
           <DialogHeader>
             <DialogTitle>{selectedTopic} - Detailed Plan</DialogTitle>
           </DialogHeader>
+
+          {/* ---- NEW: Human Anatomy (RAG) section; shows only for Anatomy and only if context exists ---- */}
+          {selectedCourse?.toLowerCase() === "anatomy" && uniquePages.length > 0 && (
+            <Card className="mb-6 p-4 border border-gray-200 rounded-lg bg-gray-50">
+              <h4 className="font-semibold mb-2">Gray's Anatomy</h4>
+              <Badge variant="secondary" className="mb-2">
+                Pages: {uniquePages.join(", ")}
+              </Badge>
+              <p className="text-sm text-muted-foreground">
+                For reference and better understanding, read from these pages of the book "Gray's Anatomy for Students" by Richard L. Drake, A. Wayne Vogl, and Adam W. M. Mitchell.
+              </p>
+            </Card>
+          )}
+          {/* --------------------------------------------------------------------------- */}
+
           {syllabusLoading ? (
             <div className="text-center text-muted-foreground">Loading...</div>
           ) : syllabusData ? (
@@ -174,43 +214,49 @@ export function YourPlan() {
               )}
 
               {/* Videos Section */}
-              {syllabusData.resources && syllabusData.resources.filter((r: any) => r.kind === 'video').length > 0 && (
-                <div>
-                  <h4 className="font-semibold mb-2">Videos</h4>
-                  <ul className="space-y-1 text-sm">
-                    {syllabusData.resources.filter((r: any) => r.kind === 'video').map((resource: any, index: number) => (
-                      <li key={index}>
-                        <a
-                          href={resource.url}
-                          target="_blank"
-                          rel="noopener noreferrer"
-                          className="text-blue-600 hover:underline"
-                        >
-                          {resource.title}
-                        </a>
-                      </li>
-                    ))}
-                  </ul>
-                </div>
-              )}
+              {syllabusData.resources &&
+                syllabusData.resources.filter((r: any) => r.kind === "video").length > 0 && (
+                  <div>
+                    <h4 className="font-semibold mb-2">Videos</h4>
+                    <ul className="space-y-1 text-sm">
+                      {syllabusData.resources
+                        .filter((r: any) => r.kind === "video")
+                        .map((resource: any, index: number) => (
+                          <li key={index}>
+                            <a
+                              href={resource.url}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="text-blue-600 hover:underline"
+                            >
+                              {resource.title}
+                            </a>
+                          </li>
+                        ))}
+                    </ul>
+                  </div>
+                )}
 
               {/* Research Links Section */}
               <div>
                 <h4 className="font-semibold mb-2">Research Links</h4>
                 <ul className="space-y-1 text-sm">
                   {/* From resources with kind article */}
-                  {syllabusData.resources && syllabusData.resources.filter((r: any) => r.kind === 'article').map((resource: any, index: number) => (
-                    <li key={`article-${index}`}>
-                      <a
-                        href={resource.url}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        className="text-blue-600 hover:underline"
-                      >
-                        {resource.title}
-                      </a>
-                    </li>
-                  ))}
+                  {syllabusData.resources &&
+                    syllabusData.resources
+                      .filter((r: any) => r.kind === "article")
+                      .map((resource: any, index: number) => (
+                        <li key={`article-${index}`}>
+                          <a
+                            href={resource.url}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="text-blue-600 hover:underline"
+                          >
+                            {resource.title}
+                          </a>
+                        </li>
+                      ))}
                   {/* From pubmed overview */}
                   {syllabusData.pubmed && syllabusData.pubmed.overview && (
                     <>
@@ -292,40 +338,42 @@ export function YourPlan() {
                     </>
                   )}
                   {/* From pubmed by_subtopic */}
-                  {syllabusData.pubmed && syllabusData.pubmed.by_subtopic && syllabusData.pubmed.by_subtopic.map((sub: any, index: number) => (
-                    <div key={`sub-${index}`}>
-                      <li>
-                        <a
-                          href={sub.pubmed_ui}
-                          target="_blank"
-                          rel="noopener noreferrer"
-                          className="text-blue-600 hover:underline"
-                        >
-                          {sub.subtopic} - PubMed
-                        </a>
-                      </li>
-                      <li>
-                        <a
-                          href={sub.pubmed_esearch}
-                          target="_blank"
-                          rel="noopener noreferrer"
-                          className="text-blue-600 hover:underline"
-                        >
-                          {sub.subtopic} - PubMed ESearch
-                        </a>
-                      </li>
-                      <li>
-                        <a
-                          href={sub.mesh}
-                          target="_blank"
-                          rel="noopener noreferrer"
-                          className="text-blue-600 hover:underline"
-                        >
-                          {sub.subtopic} - MeSH
-                        </a>
-                      </li>
-                    </div>
-                  ))}
+                  {syllabusData.pubmed &&
+                    syllabusData.pubmed.by_subtopic &&
+                    syllabusData.pubmed.by_subtopic.map((sub: any, index: number) => (
+                      <div key={`sub-${index}`}>
+                        <li>
+                          <a
+                            href={sub.pubmed_ui}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="text-blue-600 hover:underline"
+                          >
+                            {sub.subtopic} - PubMed
+                          </a>
+                        </li>
+                        <li>
+                          <a
+                            href={sub.pubmed_esearch}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="text-blue-600 hover:underline"
+                          >
+                            {sub.subtopic} - PubMed ESearch
+                          </a>
+                        </li>
+                        <li>
+                          <a
+                            href={sub.mesh}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="text-blue-600 hover:underline"
+                          >
+                            {sub.subtopic} - MeSH
+                          </a>
+                        </li>
+                      </div>
+                    ))}
                   {/* From pubmed adjacent */}
                   {syllabusData.pubmed && syllabusData.pubmed.adjacent && (
                     <li>
@@ -343,25 +391,28 @@ export function YourPlan() {
               </div>
 
               {/* Documents and Papers Section */}
-              {syllabusData.resources && syllabusData.resources.filter((r: any) => r.kind !== 'video' && r.kind !== 'article').length > 0 && (
-                <div>
-                  <h4 className="font-semibold mb-2">Documents & Papers</h4>
-                  <ul className="space-y-1 text-sm">
-                    {syllabusData.resources.filter((r: any) => r.kind !== 'video' && r.kind !== 'article').map((resource: any, index: number) => (
-                      <li key={index}>
-                        <a
-                          href={resource.url}
-                          target="_blank"
-                          rel="noopener noreferrer"
-                          className="text-blue-600 hover:underline"
-                        >
-                          {resource.title} ({resource.kind})
-                        </a>
-                      </li>
-                    ))}
-                  </ul>
-                </div>
-              )}
+              {syllabusData.resources &&
+                syllabusData.resources.filter((r: any) => r.kind !== "video" && r.kind !== "article").length > 0 && (
+                  <div>
+                    <h4 className="font-semibold mb-2">Documents & Papers</h4>
+                    <ul className="space-y-1 text-sm">
+                      {syllabusData.resources
+                        .filter((r: any) => r.kind !== "video" && r.kind !== "article")
+                        .map((resource: any, index: number) => (
+                          <li key={index}>
+                            <a
+                              href={resource.url}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="text-blue-600 hover:underline"
+                            >
+                              {resource.title} ({resource.kind})
+                            </a>
+                          </li>
+                        ))}
+                    </ul>
+                  </div>
+                )}
             </div>
           ) : (
             <div className="text-center text-muted-foreground">Failed to load plan details</div>

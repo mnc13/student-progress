@@ -199,6 +199,7 @@ def list_tasks(
             "hours": t.hours,
             "status": t.status,
             "completion_percent": t.completion_percent,
+            "context": getattr(t, "context", None),
         }
         for t in tasks
     ]
@@ -255,6 +256,7 @@ def update_task(
         "hours": t.hours,
         "status": t.status,
         "completion_percent": t.completion_percent,
+        "context": getattr(t, "context", None),
     }
 
 
@@ -315,9 +317,9 @@ def debug_groq():
 
 @router.get("/courses/{course}/topics/{topic}/syllabus")
 def syllabus_proxy(course: str, topic: str):
-    # Lightweight passthrough for a single-topic enrichment view
-    data = fetch_topic_enrichment(course, [topic])
-    return data.get(topic, {"subtopics": [], "resources": []})
+    # Lightweight passthrough for a single-topic subtopic map view
+    data = fetch_subtopic_map_with_pubmed(topic, course)
+    return data or {"subtopics": [], "study_path": [], "resource_hints": []}
 
 
 # ---------------------------------------------------------------------------
