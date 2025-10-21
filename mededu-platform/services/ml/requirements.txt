@@ -1,7 +1,0 @@
-fastapi
-uvicorn[standard]
-pydantic
-transformers>=4.43.0
-accelerate
-torch
-bitsandbytes; platform_system != "Windows"
