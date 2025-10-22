@@ -337,32 +337,41 @@ def generate_study_tasks(
         if not tasks_json:
             tasks_json = _fallback_plan(upc, weak)
 
-        # ---------- UPDATED: Anatomy RAG JSON with chapter + page ----------
-        if course.lower() == "anatomy":
-            topic_context_cache: Dict[str, str] = {}
+        # ---------- Attach RAG JSON with chapter + page for ANY supported course ----------
+        try:
+            topic_context_cache: Dict[tuple, str] = {}
+            course_key = course.lower().replace(" ", "_")
+
             for t in tasks_json:
-                topic = t.get("topic", "")
+                topic = (t.get("topic") or upc.topic or "").strip()
                 if not topic:
                     continue
-                if topic not in topic_context_cache:
-                    try:
-                        hits = retrieve_context(topic, top_k=3) or []
-                        mapped = []
-                        for h in hits:
-                            src = (h.get("source") or {})
-                            mapped.append({
-                                "chapter": src.get("chapter", "Unknown Chapter"),
-                                "page": int(src.get("page", 0) or 0),
-                                "file": src.get("file", "anatomy_v3.pdf"),
-                                "preview": (h.get("text") or "")[:240].replace("\n", " ")
-                            })
-                        topic_context_cache[topic] = json.dumps({"human_anatomy": mapped})
-                    except Exception as e:
-                        log.warning("[RAG] Failed to retrieve context for %s: %s", topic, e)
-                        topic_context_cache[topic] = json.dumps({"human_anatomy": []})
-                t["context"] = topic_context_cache[topic]
-        # -------------------------------------------------------------------
 
+                cache_key = (course_key, topic)
+                if cache_key not in topic_context_cache:
+                    hits = retrieve_context(course, topic, top_k=3)
+                    mapped = []
+                    for h in hits:
+                        src = (h.get("source") or {})
+                        mapped.append({
+                            "chapter": src.get("chapter", "Unknown Chapter"),
+                            "page": int(src.get("page", 0) or 0),
+                            "file": src.get("file", ""),
+                            "preview": (h.get("text") or "")[:240].replace("\n", " "),
+                        })
+
+                    # payload keyed by course slug + legacy key for Anatomy
+                    payload = {course_key: mapped}
+                    if course_key == "anatomy":           # <-- legacy support for your UI
+                        payload["human_anatomy"] = mapped  # <-- old key your frontend used
+
+                    topic_context_cache[cache_key] = json.dumps(payload)
+
+                t["context"] = topic_context_cache[cache_key]
+        except Exception as e:
+            log.warning("[RAG] context attach failed for %s/%s: %s", course, upc.topic, e)
+        # -------------------------------------------------------------------------------
+        
         # Postprocess & persist
         for t in tasks_json:
             try:

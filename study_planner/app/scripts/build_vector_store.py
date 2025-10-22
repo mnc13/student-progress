@@ -1,84 +1,59 @@
-import os
-import re
-import pickle
-import textwrap
+# app/scripts/build_vector_store.py
+import os, re, pickle, textwrap, argparse
 from typing import Iterable, Dict, List
-
-import faiss
-import fitz  # PyMuPDF
-import numpy as np
+import faiss, fitz, numpy as np
 from sentence_transformers import SentenceTransformer
 
-# -------------------------------------------------
-# Paths
-# -------------------------------------------------
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-PDF_PATH = os.path.join(BASE_DIR, "anatomy.pdf")   # put PDF next to this script
-DATA_DIR = os.path.join(BASE_DIR, "data")
-os.makedirs(DATA_DIR, exist_ok=True)
+DATA_ROOT = os.path.join(BASE_DIR, "data")
+os.makedirs(DATA_ROOT, exist_ok=True)
 
-INDEX_FILE = os.path.join(DATA_DIR, "faiss.index")
-META_FILE  = os.path.join(DATA_DIR, "index.pkl")
-
-# -------------------------------------------------
-# Config (RAM-friendly)
-# -------------------------------------------------
-EMBED_MODEL      = "sentence-transformers/all-MiniLM-L6-v2"
-CHUNK_SIZE       = 1600    # larger chunk => fewer chunks
-CHUNK_OVERLAP    = 0       # zero overlap to minimize count
-BATCH_MAX_CHUNKS = 800     # embed this many chunks per batch
-PREVIEW_LEN      = 240
+EMBED_MODEL   = "sentence-transformers/all-MiniLM-L6-v2"
+CHUNK_SIZE    = int(os.getenv("CHUNK_SIZE", "1600"))
+_overlap_env  = os.getenv("CHUNK_OVERLAP", "0")
+if _overlap_env.endswith("%"):
+    pct = max(0, min(90, int(_overlap_env[:-1] or "0")))
+    CHUNK_OVERLAP = max(0, (CHUNK_SIZE * pct) // 100)
+else:
+    CHUNK_OVERLAP = max(0, int(_overlap_env))
+CROSS_PAGE_OVERLAP = os.getenv("CROSS_PAGE_OVERLAP", "0") not in {"0", "false", "False"}
+BATCH_MAX_CHUNKS   = int(os.getenv("BATCH_MAX_CHUNKS", "800"))
+PREVIEW_LEN        = int(os.getenv("PREVIEW_LEN", "240"))
 
 chapter_regex = re.compile(r"^\s*Chapter\s+\d+\b.*", re.IGNORECASE)
 
-def chunk_text_stream(txt: str, size: int, overlap: int) -> Iterable[str]:
-    """
-    Generator (NO big lists). Yields slices of txt.
-    """
-    if not txt:
-        return
-    txt = txt.strip()
-    n = len(txt)
+def chunk_text_stream(txt: str, size: int, overlap: int):
+    if not txt or size <= 0: return
+    txt = txt.strip(); n = len(txt)
+    overlap = max(0, min(overlap, size - 1)); step = size - overlap
     start = 0
-    if overlap < 0:
-        overlap = 0
     while start < n:
-        end = start + size
-        if end > n:
-            end = n
+        end = min(start + size, n)
         yield txt[start:end]
-        if end == n:
-            break
-        # next window start
-        start = end - overlap
-        if start < 0 or start >= n:
-            break
+        if end >= n: break
+        start += step
 
 def likely_header(line: str) -> bool:
-    """
-    Treat obvious headings as headers:
-      - lines starting with 'Chapter ' or 'Section '
-      - ALL-CAPS lines of reasonable length (e.g., 'UPPER LIMB')
-      - Short ALL-CAPS with digits (e.g., 'SECTION 1')
-    """
     s = (line or "").strip()
-    if not s:
-        return False
-    return (
-        s.lower().startswith("chapter ")
-        or s.lower().startswith("section ")
-        or (s.isupper() and len(s) >= 8)
-        or (s.replace(" ", "").isupper() and any(ch.isdigit() for ch in s))
+    return bool(
+        s and (
+            s.lower().startswith("chapter ")
+            or s.lower().startswith("section ")
+            or (s.isupper() and len(s) >= 8)
+            or (s.replace(" ", "").isupper() and any(ch.isdigit() for ch in s))
+        )
     )
 
-def main():
-    if not os.path.exists(PDF_PATH):
-        raise FileNotFoundError(f"PDF not found at: {PDF_PATH}")
+def build(pdf_path: str, out_dir: str):
+    if not os.path.exists(pdf_path):
+        raise FileNotFoundError(f"PDF not found: {pdf_path}")
+    os.makedirs(out_dir, exist_ok=True)
+    index_file = os.path.join(out_dir, "faiss.index")
+    meta_file  = os.path.join(out_dir, "index.pkl")
 
-    print("[INFO] Loading PDF...")
-    doc = fitz.open(PDF_PATH)
+    print(f"[INFO] Loading: {pdf_path}")
+    doc = fitz.open(pdf_path)
 
-    # -------- First pass: detect chapter/section header per page --------
     chapter_for_page: Dict[int, str] = {}
     last_header = "Unknown Chapter"
     for p in range(len(doc)):
@@ -86,54 +61,50 @@ def main():
         header = None
         for line in page_text.splitlines():
             s = line.strip()
-            # accept either strict "Chapter N ..." or broader "likely_header"
             if chapter_regex.match(s) or likely_header(s):
-                header = s
-                break
-        if header:
-            last_header = header
+                header = s; break
+        if header: last_header = header
         chapter_for_page[p] = last_header
 
-    print("[INFO] Building FAISS index incrementally…")
     embedder = SentenceTransformer(EMBED_MODEL)
     dim = embedder.get_sentence_embedding_dimension()
     index = faiss.IndexFlatL2(dim)
 
     all_previews: List[str] = []
     all_meta: List[Dict] = []
-
     batch_texts: List[str] = []
     batch_meta: List[Dict]  = []
 
     def flush_batch():
-        nonlocal batch_texts, batch_meta, index, all_previews, all_meta
-        if not batch_texts:
-            return
+        nonlocal batch_texts, batch_meta
+        if not batch_texts: return
         print(f"[INFO] Embedding batch of {len(batch_texts)} chunks…")
         embs = embedder.encode(
-            batch_texts,
-            convert_to_numpy=True,
-            normalize_embeddings=True,
-            show_progress_bar=False,
+            batch_texts, convert_to_numpy=True, normalize_embeddings=True, show_progress_bar=False
         ).astype(np.float32)
         index.add(embs)
-        # store preview + meta only (keeps meta.pkl small)
         for t, m in zip(batch_texts, batch_meta):
             all_previews.append(t[:PREVIEW_LEN].replace("\n", " "))
             all_meta.append(m)
-        batch_texts.clear()
-        batch_meta.clear()
+        batch_texts.clear(); batch_meta.clear()
 
     total_chunks = 0
-    print("[INFO] Creating chunks with page metadata…")
+    carry = ""
+    print("[INFO] Chunking…")
     for p in range(len(doc)):
         page_text = (doc[p].get_text("text") or "").strip()
         if not page_text:
+            carry = "" if CROSS_PAGE_OVERLAP else carry
             continue
-        for ch in chunk_text_stream(page_text, CHUNK_SIZE, CHUNK_OVERLAP):
-            batch_texts.append(ch)
+
+        working = (carry + page_text) if (CROSS_PAGE_OVERLAP and carry) else page_text
+        for ch in chunk_text_stream(working, CHUNK_SIZE, CHUNK_OVERLAP):
+            payload = ch[len(carry):] if (CROSS_PAGE_OVERLAP and carry and ch.startswith(carry) and len(ch) > len(carry)) else ch
+            if not payload.strip(): continue
+
+            batch_texts.append(payload)
             batch_meta.append({
-                "file": os.path.basename(PDF_PATH),
+                "file": os.path.basename(pdf_path),
                 "chapter": chapter_for_page.get(p, "Unknown Chapter"),
                 "page": p + 1
             })
@@ -141,28 +112,30 @@ def main():
             if len(batch_texts) >= BATCH_MAX_CHUNKS:
                 flush_batch()
 
-    # final flush
+        carry = page_text[-CHUNK_OVERLAP:] if (CROSS_PAGE_OVERLAP and CHUNK_OVERLAP > 0) else ""
+
     flush_batch()
     doc.close()
 
-    print(f"[INFO] Total chunks embedded: {total_chunks}")
-    faiss.write_index(index, INDEX_FILE)
-    with open(META_FILE, "wb") as f:
+    faiss.write_index(index, index_file)
+    with open(meta_file, "wb") as f:
         pickle.dump({"previews": all_previews, "metadata": all_meta}, f)
 
-    print(f"[SUCCESS] Saved index: {INDEX_FILE}")
-    print(f"[SUCCESS] Saved meta : {META_FILE}")
-
-    print("\n========== SAMPLE ENTRIES ==========")
+    print(f"[OK] Chunks: {total_chunks}")
+    print(f"[OK] Saved index => {index_file}")
+    print(f"[OK] Saved meta  => {meta_file}")
+    print("\n========== SAMPLE ==========")
     for i in range(min(5, len(all_previews))):
         meta = all_meta[i]
         label = f"{meta['file']} - {meta['chapter']} (p{meta['page']})"
         print(f"ID: {i} | {label}")
         print(textwrap.fill(all_previews[i], width=100))
         print("-" * 80)
-
-    print(f"\n[INFO] FAISS index built with {index.ntotal} vectors.")
-    print("[DONE] Vector store ready.")
+    print(f"[INFO] FAISS vectors: {index.ntotal}")
 
 if __name__ == "__main__":
-    main()
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--pdf", required=True, help="Path to the course PDF")
+    ap.add_argument("--out", required=True, help="Output directory (e.g., app/scripts/data/anatomy)")
+    args = ap.parse_args()
+    build(args.pdf, args.out)
