@@ -69,3 +69,7 @@ data/*.parquet
 data
 anatomy_v3.pdf
 anatomy.pdf
+physiology.pdf
+biochemistry.pdf    
+pharmacology.pdf
+forensic_medicine.pdf

@@ -8,6 +8,41 @@ import { Button } from "@/components/ui/button";
 import { useEffect, useRef, useState, useMemo } from "react";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 
+const slugifyCourse = (c?: string) =>
+    (c || "").toLowerCase().replace(/\s+/g, "_");
+
+const prettyCourse = (c?: string) =>
+    (c || "").replace(/_/g, " ").replace(/\b\w/g, (m) => m.toUpperCase());
+
+// Course slugs -> canonical book metadata shown in the RAG card
+const BOOK_META: Record<string, { title: string; edition: string; authors: string }> = {
+  anatomy: {
+    title: "Gray’s Anatomy for Students",
+    edition: "4th Edition",
+    authors: "Richard L. Drake, A. Wayne Vogl, Adam W. M. Mitchell",
+  },
+  physiology: {
+    title: "Guyton & Hall Textbook of Medical Physiology",
+    edition: "12th Edition",
+    authors: "John E. Hall (founded by Arthur C. Guyton)",
+  },
+  biochemistry: {
+    title: "Textbook of Biochemistry for Medical Students",
+    edition: "7th Edition",
+    authors: "D. M. Vasudevan, Sreekumari S.",
+  },
+  pharmacology: {
+    title: "Essentials of Medical Pharmacology",
+    edition: "8th Edition",
+    authors: "K. D. Tripathi",
+  },
+  forensic_medicine: {
+    title: "Review of Forensic Medicine & Toxicology",
+    edition: "7th Edition",
+    authors: "Gautam Biswas",
+  },
+};
+
 export function YourPlan() {
   const { studentId, selectedCourse } = useAuth();
   const queryClient = useQueryClient();
@@ -98,43 +133,45 @@ export function YourPlan() {
     return g;
   }, [tasks]);
 
-  // ---- NEW: parse Anatomy RAG context from tasks for selected topic (non-breaking) ----
-  const humanAnatomyCitations = useMemo(() => {
+  // ---- Parse RAG context for ANY course (keeps Anatomy legacy key working) ----
+  const ragHits = useMemo(() => {
     if (!selectedTopic || !selectedCourse) return [];
-    if (selectedCourse.toLowerCase() !== "anatomy") return [];
     const topicTasks = groupedTasks[selectedTopic] || [];
-    // Find first task that has a context payload
+    const slug = slugifyCourse(selectedCourse);
+
     for (const t of topicTasks) {
       const raw = t?.context;
       if (!raw) continue;
+
       try {
         const parsed = typeof raw === "string" ? JSON.parse(raw) : raw;
-        const arr = parsed?.human_anatomy;
-        if (Array.isArray(arr)) {
-          // De-dup a bit by (chapter+page)
-          const seen = new Set<string>();
-          const dedup = [];
-          for (const item of arr) {
-            const k = `${item?.chapter ?? ""}::${item?.page ?? ""}`;
-            if (seen.has(k)) continue;
-            seen.add(k);
-            dedup.push(item);
-          }
-          return dedup;
+        // Read using the course slug; fall back to legacy "human_anatomy"
+        const arr = parsed?.[slug] || parsed?.human_anatomy || [];
+        if (!Array.isArray(arr)) continue;
+
+        // De-dup by (chapter,page)
+        const seen = new Set<string>();
+        const dedup: any[] = [];
+        for (const item of arr) {
+          const key = `${item?.chapter ?? ""}::${item?.page ?? ""}`;
+          if (seen.has(key)) continue;
+          seen.add(key);
+          dedup.push(item);
         }
+        return dedup;
       } catch {
-        // ignore parse errors silently
+        // ignore parse/shape errors
       }
     }
     return [];
   }, [selectedTopic, selectedCourse, groupedTasks]);
 
-  // Collect unique pages for display
+  // Pages we’ll show on the badge
   const uniquePages = useMemo(() => {
-    const pages = humanAnatomyCitations.map((c: any) => c?.page).filter(p => p != null && p > 0);
+    const pages = ragHits.map((c: any) => c?.page).filter((p) => p != null && p > 0);
     return [...new Set(pages)].sort((a, b) => a - b);
-  }, [humanAnatomyCitations]);
-  // -------------------------------------------------------------------------------------
+  }, [ragHits]);
+
 
   return (
     <Card className="flex flex-col shadow-xl shadow-blue-200/60">
@@ -183,15 +220,31 @@ export function YourPlan() {
             <DialogTitle>{selectedTopic} - Detailed Plan</DialogTitle>
           </DialogHeader>
 
-          {/* ---- NEW: Human Anatomy (RAG) section; shows only for Anatomy and only if context exists ---- */}
-          {selectedCourse?.toLowerCase() === "anatomy" && uniquePages.length > 0 && (
+          {/* ---- RAG citations (all courses). Shows when context exists for the selected topic ---- */}
+          {ragHits.length > 0 && (
             <Card className="mb-6 p-4 border border-gray-200 rounded-lg bg-gray-50">
-              <h4 className="font-semibold mb-2">Gray's Anatomy</h4>
-              <Badge variant="secondary" className="mb-2">
-                Pages: {uniquePages.join(", ")}
-              </Badge>
+              <h4 className="font-semibold mb-2">
+                {BOOK_META[slugifyCourse(selectedCourse!)]?.title ?? prettyCourse(selectedCourse)} — Recommended Pages
+              </h4>
+
+              {uniquePages.length > 0 && (
+                <Badge variant="secondary" className="mb-3">
+                  Pages: {uniquePages.join(", ")}
+                </Badge>
+              )}
+
               <p className="text-sm text-muted-foreground">
-                For reference and better understanding, read from these pages of the book "Gray's Anatomy for Students" by Richard L. Drake, A. Wayne Vogl, and Adam W. M. Mitchell.
+                For better understanding of <span className="font-medium">{selectedTopic}</span>, follow the above pages in
+                {" "}
+                <span className="font-medium">
+                  {BOOK_META[slugifyCourse(selectedCourse!)]?.title ?? prettyCourse(selectedCourse)}
+                </span>
+                {BOOK_META[slugifyCourse(selectedCourse!)] && (
+                  <>
+                    {" "}({BOOK_META[slugifyCourse(selectedCourse!)]!.edition}), by{" "}
+                    {BOOK_META[slugifyCourse(selectedCourse!)]!.authors}.
+                  </>
+                )}
               </p>
             </Card>
           )}
