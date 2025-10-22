@@ -1,3 +1,4 @@
+# app/scripts/build_vector_store.py
 import os
 import re
 import pickle
@@ -21,38 +22,46 @@ INDEX_FILE = os.path.join(DATA_DIR, "faiss.index")
 META_FILE  = os.path.join(DATA_DIR, "index.pkl")
 
 # -------------------------------------------------
-# Config (RAM-friendly)
+# Config (RAM-friendly)  — now with overlap controls
 # -------------------------------------------------
 EMBED_MODEL      = "sentence-transformers/all-MiniLM-L6-v2"
-CHUNK_SIZE       = 1600    # larger chunk => fewer chunks
-CHUNK_OVERLAP    = 0       # zero overlap to minimize count
-BATCH_MAX_CHUNKS = 800     # embed this many chunks per batch
-PREVIEW_LEN      = 240
+CHUNK_SIZE       = int(os.getenv("CHUNK_SIZE", "1600"))
+# CHUNK_OVERLAP can be int (e.g., "200") or percent (e.g., "20%")
+_overlap_env = os.getenv("CHUNK_OVERLAP", "0")
+if _overlap_env.endswith("%"):
+    pct = max(0, min(90, int(_overlap_env[:-1] or "0")))
+    CHUNK_OVERLAP = max(0, (CHUNK_SIZE * pct) // 100)
+else:
+    CHUNK_OVERLAP = max(0, int(_overlap_env))
+
+# If True, carry the last CHUNK_OVERLAP chars of a page into the next page
+CROSS_PAGE_OVERLAP = os.getenv("CROSS_PAGE_OVERLAP", "0") not in {"0", "false", "False"}
+
+BATCH_MAX_CHUNKS = int(os.getenv("BATCH_MAX_CHUNKS", "800"))
+PREVIEW_LEN      = int(os.getenv("PREVIEW_LEN", "240"))
 
 chapter_regex = re.compile(r"^\s*Chapter\s+\d+\b.*", re.IGNORECASE)
 
 def chunk_text_stream(txt: str, size: int, overlap: int) -> Iterable[str]:
     """
-    Generator (NO big lists). Yields slices of txt.
+    Sliding window chunker with overlap.
+    Yields chunks of length <= size; step = size - overlap.
     """
-    if not txt:
+    if not txt or size <= 0:
         return
     txt = txt.strip()
     n = len(txt)
+
+    overlap = max(0, min(overlap, size - 1))
+    step = size - overlap
+
     start = 0
-    if overlap < 0:
-        overlap = 0
     while start < n:
-        end = start + size
-        if end > n:
-            end = n
+        end = min(start + size, n)
         yield txt[start:end]
-        if end == n:
+        if end >= n:
             break
-        # next window start
-        start = end - overlap
-        if start < 0 or start >= n:
-            break
+        start += step
 
 def likely_header(line: str) -> bool:
     """
@@ -126,12 +135,30 @@ def main():
 
     total_chunks = 0
     print("[INFO] Creating chunks with page metadata…")
+
+    carry = ""  # last CHUNK_OVERLAP chars from previous page (if enabled)
+
     for p in range(len(doc)):
         page_text = (doc[p].get_text("text") or "").strip()
         if not page_text:
+            # still update carry to empty for next iteration
+            carry = "" if CROSS_PAGE_OVERLAP else carry
             continue
-        for ch in chunk_text_stream(page_text, CHUNK_SIZE, CHUNK_OVERLAP):
-            batch_texts.append(ch)
+
+        # Prepend cross-page carry to current page text to preserve continuity
+        working_text = (carry + page_text) if (CROSS_PAGE_OVERLAP and carry) else page_text
+
+        for ch in chunk_text_stream(working_text, CHUNK_SIZE, CHUNK_OVERLAP):
+            # If we prepended carry, avoid indexing the carry-only prefix twice
+            if CROSS_PAGE_OVERLAP and carry and ch.startswith(carry) and len(ch) > len(carry):
+                payload = ch[len(carry):]
+            else:
+                payload = ch
+
+            if not payload.strip():
+                continue
+
+            batch_texts.append(payload)
             batch_meta.append({
                 "file": os.path.basename(PDF_PATH),
                 "chapter": chapter_for_page.get(p, "Unknown Chapter"),
@@ -140,6 +167,9 @@ def main():
             total_chunks += 1
             if len(batch_texts) >= BATCH_MAX_CHUNKS:
                 flush_batch()
+
+        # Prepare carry for the *next* page (use only current page's tail)
+        carry = page_text[-CHUNK_OVERLAP:] if (CROSS_PAGE_OVERLAP and CHUNK_OVERLAP > 0) else ""
 
     # final flush
     flush_batch()
